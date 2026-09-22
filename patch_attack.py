@@ -93,6 +93,62 @@ def apply_patch(
     return patched
 
 
+# ── losses ───────────────────────────────────────────────────────────────────
+
+def tv_loss(patch_01: torch.Tensor) -> torch.Tensor:
+    """
+    Total Variation loss — penalises pixel-to-pixel differences at print resolution.
+    Forces spatial coherence so the optimiser can't exploit high-frequency noise
+    that averages away through the bilinear downsample.
+    """
+    dh = (patch_01[:, :, 1:, :] - patch_01[:, :, :-1, :]).abs().mean()
+    dw = (patch_01[:, :, :, 1:] - patch_01[:, :, :, :-1]).abs().mean()
+    return dh + dw
+
+
+# Colours reproducible by a typical inkjet on matte paper (sRGB [0,1]).
+# Source: Eykholt et al. 2018 supplementary + common inkjet characterisation.
+_PRINTABLE_COLOURS = torch.tensor([
+    [0.000, 0.000, 0.000],  # black
+    [1.000, 1.000, 1.000],  # white
+    [1.000, 0.000, 0.000],  # red
+    [0.000, 1.000, 0.000],  # green
+    [0.000, 0.000, 1.000],  # blue
+    [1.000, 1.000, 0.000],  # yellow
+    [0.000, 1.000, 1.000],  # cyan
+    [1.000, 0.000, 1.000],  # magenta
+    [0.800, 0.000, 0.000],  # dark red
+    [0.000, 0.600, 0.000],  # dark green
+    [0.000, 0.000, 0.800],  # dark blue
+    [0.900, 0.500, 0.000],  # orange
+    [0.600, 0.300, 0.000],  # brown
+    [0.500, 0.500, 0.500],  # mid grey
+    [0.750, 0.750, 0.750],  # light grey
+    [0.250, 0.250, 0.250],  # dark grey
+    [1.000, 0.600, 0.600],  # light red / pink
+    [0.600, 0.800, 1.000],  # light blue
+    [0.600, 1.000, 0.600],  # light green
+    [1.000, 0.900, 0.600],  # cream / light yellow
+], dtype=torch.float32)
+
+
+def printability_loss(patch_01: torch.Tensor,
+                      printable_colours: torch.Tensor = None) -> torch.Tensor:
+    """
+    Non-Printability Score (NPS) from Eykholt et al.
+    For each pixel, find the minimum squared distance to any printable colour.
+    Returns mean over all pixels — differentiable w.r.t. patch_01.
+    """
+    if printable_colours is None:
+        printable_colours = _PRINTABLE_COLOURS
+    pc = printable_colours.to(patch_01.device)
+
+    pixels = patch_01.squeeze(0).permute(1, 2, 0).reshape(-1, 3)  # (N, 3)
+    diff   = pixels.unsqueeze(1) - pc.unsqueeze(0)                # (N, P, 3)
+    dist   = (diff ** 2).sum(-1)                                   # (N, P)
+    return dist.min(dim=1).values.mean()
+
+
 # ── optimisation loop ────────────────────────────────────────────────────────
 
 def optimise_patch(
@@ -109,6 +165,8 @@ def optimise_patch(
     print_cm:     float = 8.0,
     sign_diam_mm: float = 190.0,
     real_sign_mm: float = 450.0,
+    nps_weight:   float = 0.01,
+    tv_weight:    float = 0.05,
 ) -> torch.Tensor:
     """
     patch_size is the PRINT resolution of the patch (e.g. 945 = 8cm @ 300 DPI).
@@ -116,6 +174,10 @@ def optimise_patch(
     correct footprint in the 224px model input, so gradients flow through the
     resize back to the full-res tensor.  What you optimise is literally what
     you print — no separate upscale step.
+
+    TV loss forces spatial coherence at print resolution, preventing the
+    optimiser from exploiting high-frequency noise that averages away through
+    the bilinear downsample.
     """
     if device is None:
         device = get_device()
@@ -124,15 +186,8 @@ def optimise_patch(
     for p in model.parameters():
         p.requires_grad = False
 
-    # Compute patch footprint in model input space (224px)
-    # Sign occupies sign_diam_mm/real_sign_mm of the real sign diameter.
-    # In the model input (224px) the sign fills ~80% = 179px.
     patch_mm        = print_cm * 10.0
-    patch_frac      = patch_mm / real_sign_mm          # fraction of real sign diam
     sign_input_px   = int(224 * 0.80)                  # ~179px sign in 224px input
-    target_patch_px = max(4, int(sign_input_px * patch_frac * (sign_diam_mm / real_sign_mm)))
-    # Simpler direct calculation: patch covers patch_mm of the 190mm rendered sign
-    # which fills 179px → patch_px = 179 * patch_mm / 190
     target_patch_px = max(4, int(sign_input_px * patch_mm / sign_diam_mm))
     print(f"Print-res patch : {patch_size}px  ({print_cm}cm @ 300 DPI)")
     print(f"Model footprint : {target_patch_px}px  in 224px input")
@@ -143,11 +198,9 @@ def optimise_patch(
     optimizer = torch.optim.Adam([patch_01], lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=steps)
 
-    if not universal:
-        indices = [i for i, (_, l) in enumerate(dataset) if l != target_label]
-        sub_ds  = torch.utils.data.Subset(dataset, indices)
-    else:
-        sub_ds = dataset
+    sub_ds = dataset if universal else torch.utils.data.Subset(
+        dataset, [i for i, (_, l) in enumerate(dataset) if l != target_label]
+    )
 
     loader = torch.utils.data.DataLoader(
         sub_ds, batch_size=batch_size, shuffle=True,
@@ -180,18 +233,26 @@ def optimise_patch(
         total_loss = torch.tensor(0.0, device=device)
 
         for _ in range(eot_samples):
-            patched = apply_patch(imgs, patch_norm, randomise_placement=True,
-                                  target_patch_px=target_patch_px)
+            patched     = apply_patch(imgs, patch_norm, randomise_placement=True,
+                                      target_patch_px=target_patch_px)
             patched_01  = patched * std + mean
             patched_01  = eot_batch(patched_01.clone())
             patched_eot = (patched_01 - mean) / std
 
             logits = model(patched_eot)
-            labels = target_t.expand(B)
-            loss   = F.cross_entropy(logits, labels)
+            loss   = F.cross_entropy(logits, target_t.expand(B))
             total_loss = total_loss + loss
 
         total_loss = total_loss / eot_samples
+
+        # TV loss — force spatial coherence at print resolution
+        if tv_weight > 0:
+            total_loss = total_loss + tv_weight * tv_loss(patch_01.clamp(0, 1))
+
+        # NPS — penalise colours inkjet can't reproduce
+        if nps_weight > 0:
+            total_loss = total_loss + nps_weight * printability_loss(patch_01.clamp(0, 1))
+
         optimizer.zero_grad()
         total_loss.backward()
         optimizer.step()
@@ -228,7 +289,6 @@ def save_patch_png(patch_01: torch.Tensor, path: str, print_cm: float = 8.0):
     dpi = 300
     px  = int(print_cm / 2.54 * dpi)
     if img.size != (px, px):
-        # Only resize if somehow wrong size (shouldn't happen with --patch-size 945)
         img = img.resize((px, px), resample=Image.LANCZOS)
     img.save(path, dpi=(dpi, dpi))
     print(f"Saved print-ready patch: {path}  ({img.size[0]}×{img.size[1]} px @ {dpi} DPI)")
@@ -320,6 +380,8 @@ def main(args):
         device       = device,
         universal    = args.universal,
         print_cm     = args.print_cm,
+        nps_weight   = args.nps_weight,
+        tv_weight    = args.tv_weight,
     )
 
     torch.save(patch_01, args.out)
@@ -348,4 +410,6 @@ if __name__ == "__main__":
     p.add_argument("--eot-samples",   type=int,   default=16)
     p.add_argument("--batch",         type=int,   default=32)
     p.add_argument("--print-cm",      type=float, default=8.0,  help="Printed patch size in cm")
+    p.add_argument("--nps-weight",    type=float, default=0.01, help="Printability loss weight (0 to disable)")
+    p.add_argument("--tv-weight",     type=float, default=0.05, help="Total variation loss weight (0 to disable)")
     main(p.parse_args())
