@@ -27,7 +27,7 @@ import torch.nn as nn
 from tqdm import tqdm
 
 from dataset import make_dataloaders, ALL_SPEEDS, NUM_CLASSES
-from model import build_surrogate, get_device, save
+from model import build_surrogate, get_device, save, ARCH_CHOICES
 
 
 def train(args):
@@ -46,7 +46,7 @@ def train(args):
     print(f"Train batches: {len(train_loader)}  Val batches: {len(val_loader)}")
     print(f"Classes ({NUM_CLASSES}): {ALL_SPEEDS}")
 
-    model = build_surrogate(model_id=args.model_id, arch=args.arch).to(device)
+    model = build_surrogate(arch=args.arch).to(device)
     model.freeze_backbone()
 
     # Only the remapping head is trained initially
@@ -57,20 +57,30 @@ def train(args):
     criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
+    # Arch-specific: which backbone parameter names to unfreeze for stage 2.
+    # ResNets: last residual block is "layer4" + "fc"
+    # MobileNetV3 / EfficientNet: last inverted residual + classifier
+    _UNFREEZE_PATTERNS = {
+        "resnet18":           ["layer4", "fc"],
+        "resnet50":           ["layer4", "fc"],
+        "mobilenet_v3_small": ["features.12", "classifier"],
+        "mobilenet_v3_large": ["features.16", "classifier"],
+        "efficientnet_b0":    ["features.8",  "classifier"],
+    }
+    unfreeze_patterns = _UNFREEZE_PATTERNS.get(args.arch, ["classifier"])
+
     best_acc = 0.0
 
     for epoch in range(1, args.epochs + 1):
         if epoch == args.unfreeze_epoch:
-            print(f"Epoch {epoch}: unfreezing backbone last block")
-            # Unfreeze only layer4 (last residual block) — keeps earlier features stable
+            print(f"Epoch {epoch}: unfreezing backbone ({unfreeze_patterns})")
+            newly_trainable = []
             for name, p in model.backbone.named_parameters():
-                if "layer4" in name or "fc" in name:
+                if any(pat in name for pat in unfreeze_patterns):
                     p.requires_grad = True
-            optimizer.add_param_group({
-                "params": [p for n, p in model.backbone.named_parameters()
-                           if ("layer4" in n or "fc" in n) and p.requires_grad],
-                "lr": args.lr * 0.05,
-            })
+                    newly_trainable.append(p)
+            if newly_trainable:
+                optimizer.add_param_group({"params": newly_trainable, "lr": args.lr * 0.05})
 
         # ── train ──
         model.train()
@@ -115,9 +125,7 @@ def train(args):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--model-id",      default="Javtor/resnet18-GTSRB",
-                   help="HuggingFace model ID for pretrained GTSRB backbone")
-    p.add_argument("--arch",          default="resnet18", choices=["resnet18", "resnet50"])
+    p.add_argument("--arch",          default="resnet18", choices=ARCH_CHOICES)
     p.add_argument("--epochs",        type=int,   default=8)
     p.add_argument("--unfreeze-epoch",type=int,   default=5,
                    help="Epoch at which to unfreeze ResNet layer4 for fine-tuning")
