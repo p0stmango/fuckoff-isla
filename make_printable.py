@@ -249,7 +249,7 @@ def test_surrogate(canvas: Image.Image, patch_path: str,
         for _ in range(n_runs):
             # apply_patch positions the patch at correct scale (75px in 224px input)
             patched    = apply_patch(sign_tensor, patch_norm,
-                                     randomise_placement=False,
+                                     randomise_placement=True,
                                      target_patch_px=target_patch_px)
             patched_01 = patched * std + mean
             patched_01 = eot_batch(patched_01.clone())
