@@ -501,6 +501,15 @@ def apply_jpeg_compression(x: torch.Tensor) -> torch.Tensor:
     out = out.permute(0, 1, 2, 4, 3, 5).contiguous().view(B, C, Hp, Wp)
     return torch.clamp(out[:, :, :H, :W], 0.0, 1.0)
 
+def apply_grayscale(x: torch.Tensor) -> torch.Tensor:
+    """
+    Mobileye S-Cam4 uses a monochrome CMOS sensor — outputs grayscale frames.
+    Convert to luminance-weighted grayscale, broadcast back to 3 channels so
+    tensor shapes stay consistent with the rest of the pipeline.
+    Placed last: the sensor collapses colour after all optical transforms.
+    """
+    gray = 0.299 * x[:, 0:1] + 0.587 * x[:, 1:2] + 0.114 * x[:, 2:3]
+    return gray.expand_as(x).contiguous()
 
 # ════════════════════════════════════════════════════════════════════════════
 # EOT APPLICATION
@@ -575,4 +584,6 @@ def eot_batch(x: torch.Tensor, n_transforms: int = 3) -> torch.Tensor:
     for fn in random.sample(CAMERA_TRANSFORMS, k=min(n_cam, len(CAMERA_TRANSFORMS))):
         x = fn(x)
 
+    # ── monochrome sensor (always last — Mobileye S-Cam4 is grayscale) ──────
+    x = apply_grayscale(x)
     return torch.clamp(x, 0.0, 1.0)
