@@ -8,17 +8,20 @@ classes well.  Fine-tuning is only needed to teach the model AU-only classes
 Strategy:
   1. Load pretrained GTSRB backbone (frozen)
   2. Train only the remapping head for a few epochs on AU synth data
-  3. Optionally unfreeze the last ResNet block for a few more epochs
+  3. Optionally unfreeze the last block for a few more epochs
 
 Usage:
-    # Minimal — head-only, AU synth data generated automatically
+    # ResNet-18 (default)
     python train.py
 
-    # Full fine-tune
-    python train.py --epochs 10 --unfreeze-epoch 5 --batch 64
+    # ResNet-50
+    python train.py --arch resnet50 --out surrogate_resnet50.pt
 
-    # Use a different HF model
-    python train.py --model-id adhisetiawan/resnet50-gtsrb --arch resnet50
+    # MobileNetV3-Small (EyeQ4 proxy)
+    python train.py --arch mobilenet_v3_small --out surrogate_mobilenet_v3_small.pt
+
+    # Full fine-tune with custom epochs
+    python train.py --arch resnet18 --epochs 10 --unfreeze-epoch 5 --batch 64
 """
 import argparse
 
@@ -28,6 +31,17 @@ from tqdm import tqdm
 
 from dataset import make_dataloaders, ALL_SPEEDS, NUM_CLASSES
 from model import build_surrogate, get_device, save, ARCH_CHOICES
+
+
+# Per-architecture parameter patterns to unfreeze in stage 2.
+# Keep earlier features frozen — they transfer well from ImageNet/GTSRB.
+_UNFREEZE_PATTERNS = {
+    "resnet18":            ["layer4", "fc"],
+    "resnet50":            ["layer4", "fc"],
+    "mobilenet_v3_small":  ["features.12", "classifier"],
+    "mobilenet_v3_large":  ["features.16", "classifier"],
+    "efficientnet_b0":     ["features.8",  "classifier"],
+}
 
 
 def train(args):
@@ -57,30 +71,22 @@ def train(args):
     criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
-    # Arch-specific: which backbone parameter names to unfreeze for stage 2.
-    # ResNets: last residual block is "layer4" + "fc"
-    # MobileNetV3 / EfficientNet: last inverted residual + classifier
-    _UNFREEZE_PATTERNS = {
-        "resnet18":           ["layer4", "fc"],
-        "resnet50":           ["layer4", "fc"],
-        "mobilenet_v3_small": ["features.12", "classifier"],
-        "mobilenet_v3_large": ["features.16", "classifier"],
-        "efficientnet_b0":    ["features.8",  "classifier"],
-    }
-    unfreeze_patterns = _UNFREEZE_PATTERNS.get(args.arch, ["classifier"])
-
+    unfreeze_patterns = _UNFREEZE_PATTERNS.get(args.arch, ["fc"])
     best_acc = 0.0
 
     for epoch in range(1, args.epochs + 1):
         if epoch == args.unfreeze_epoch:
-            print(f"Epoch {epoch}: unfreezing backbone ({unfreeze_patterns})")
-            newly_trainable = []
+            print(f"Epoch {epoch}: unfreezing {unfreeze_patterns} for {args.arch}")
             for name, p in model.backbone.named_parameters():
                 if any(pat in name for pat in unfreeze_patterns):
                     p.requires_grad = True
-                    newly_trainable.append(p)
-            if newly_trainable:
-                optimizer.add_param_group({"params": newly_trainable, "lr": args.lr * 0.05})
+            optimizer.add_param_group({
+                "params": [
+                    p for name, p in model.backbone.named_parameters()
+                    if any(pat in name for pat in unfreeze_patterns) and p.requires_grad
+                ],
+                "lr": args.lr * 0.05,
+            })
 
         # ── train ──
         model.train()
@@ -125,15 +131,15 @@ def train(args):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--arch",          default="resnet18", choices=ARCH_CHOICES)
-    p.add_argument("--epochs",        type=int,   default=8)
-    p.add_argument("--unfreeze-epoch",type=int,   default=5,
-                   help="Epoch at which to unfreeze ResNet layer4 for fine-tuning")
-    p.add_argument("--batch",         type=int,   default=64)
-    p.add_argument("--lr",            type=float, default=3e-3)
-    p.add_argument("--data",          type=str,   default="./data")
-    p.add_argument("--aus-data",      type=str,   default="./data/aus_synth")
-    p.add_argument("--workers",       type=int,   default=4)
-    p.add_argument("--n-aus",         type=int,   default=400)
-    p.add_argument("--out",           type=str,   default="surrogate.pt")
+    p.add_argument("--arch",           default="resnet18", choices=ARCH_CHOICES)
+    p.add_argument("--epochs",         type=int,   default=8)
+    p.add_argument("--unfreeze-epoch", type=int,   default=5,
+                   help="Epoch at which to unfreeze the last backbone block")
+    p.add_argument("--batch",          type=int,   default=64)
+    p.add_argument("--lr",             type=float, default=3e-3)
+    p.add_argument("--data",           type=str,   default="./data")
+    p.add_argument("--aus-data",       type=str,   default="./data/aus_synth")
+    p.add_argument("--workers",        type=int,   default=4)
+    p.add_argument("--n-aus",          type=int,   default=400)
+    p.add_argument("--out",            type=str,   default="surrogate.pt")
     train(p.parse_args())
