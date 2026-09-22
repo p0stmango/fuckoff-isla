@@ -7,13 +7,16 @@ to the sign image.  The patch is the only variable being optimised.
 Usage:
     python patch_attack.py \
         --model surrogate.pt \
+        --arch  resnet18,resnet50,mobilenet_v3_small \
         --data  ./data \
         --out   patch.pt \
         [--patch-size 945] \
         [--steps 2000] \
         [--lr 0.01] \
         [--eot-samples 16] \
-        [--batch 32]
+        [--batch 32] \
+        [--tv-weight 0.05] \
+        [--nps-weight 0.01]
 """
 import argparse
 import math
@@ -155,7 +158,7 @@ def optimise_patch(
     models:       list,
     dataset:      torch.utils.data.Dataset,
     target_label: int,
-    patch_size:   int   = 80,
+    patch_size:   int   = 945,
     steps:        int   = 2000,
     lr:           float = 0.01,
     eot_samples:  int   = 16,
@@ -181,10 +184,6 @@ def optimise_patch(
     """
     if device is None:
         device = get_device()
-
-    model.eval()
-    for p in model.parameters():
-        p.requires_grad = False
 
     patch_mm        = print_cm * 10.0
     sign_input_px   = int(224 * 0.80)                  # ~179px sign in 224px input
@@ -454,7 +453,7 @@ if __name__ == "__main__":
     p.add_argument("--out",           default="patch.pt")
     p.add_argument("--universal",     action="store_true", default=True)
     p.add_argument("--target",        type=int,   default=80,   help="Target km/h class")
-    p.add_argument("--patch-size",    type=int,   default=945,  help="Patch pixel size")
+    p.add_argument("--patch-size",    type=int,   default=945,  help="Patch pixel size (print res)")
     p.add_argument("--steps",         type=int,   default=2000)
     p.add_argument("--lr",            type=float, default=0.01)
     p.add_argument("--eot-samples",   type=int,   default=16)
