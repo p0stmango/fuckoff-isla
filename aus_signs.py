@@ -304,16 +304,14 @@ def composite_sign(
         bg = bg.filter(ImageFilter.GaussianBlur(radius=radius))
 
     # Motion blur — horizontal smear simulating car movement
+    # Implemented via numpy roll-average to avoid PIL Kernel size restrictions
     if random.random() < 0.25:
-        blur_px = random.randint(2, 6)
-        kernel  = np.zeros((blur_px, blur_px))
-        kernel[blur_px // 2, :] = 1.0 / blur_px
-        from PIL import ImageFilter as _IF
-        bg = bg.filter(_IF.Kernel(
-            size=(blur_px, blur_px),
-            kernel=kernel.flatten().tolist(),
-            scale=1, offset=0,
-        )) if blur_px <= 5 else bg.filter(ImageFilter.GaussianBlur(radius=1.5))
+        blur_px = random.randint(2, 7)
+        arr_mb  = np.array(bg, dtype=np.float32)
+        acc     = arr_mb.copy()
+        for shift in range(1, blur_px):
+            acc += np.roll(arr_mb, shift, axis=1)
+        bg = Image.fromarray((acc / blur_px).clip(0, 255).astype(np.uint8), "RGB")
 
     # Brightness / contrast variation (wider than default)
     arr = np.array(bg, dtype=np.float32)
