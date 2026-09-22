@@ -4,7 +4,6 @@ Synthetic Australian speed-limit sign generator.
 Australian sign spec:
   - Circular, white face, red border ring
   - Black speed number using Transport / Highway Gothic style typeface
-  - Small "km/h" text below the number (standard since AS 1742.2)
   - Mounted on a circular aluminium blank — no rectangular backing
 
 Generates PNG images composited onto synthetic backgrounds representing
@@ -34,15 +33,11 @@ _BLACK  = (10,  10,  10)    # near-black for ink variation
 
 
 # ── font resolution ──────────────────────────────────────────────────────────
-# AU signs use Transport / Highway Gothic — a regular-weight condensed sans.
-# Priority: regular-weight faces only, no bold variants.
 _FONT_PATHS = [
-    # macOS — Helvetica Neue Regular is the closest readily available match
     "/System/Library/Fonts/HelveticaNeue.ttc",
     "/System/Library/Fonts/Helvetica.ttc",
     "/Library/Fonts/Arial.ttf",
     "/System/Library/Fonts/Supplemental/Arial.ttf",
-    # Linux — regular weight
     "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
@@ -58,22 +53,67 @@ def _load_font(size: int) -> ImageFont.FreeTypeFont:
     return ImageFont.load_default()
 
 
+# ── perspective warp ──────────────────────────────────────────────────────────
+
+def _perspective_warp(img: Image.Image, strength: float = 0.15) -> Image.Image:
+    """
+    Apply a random perspective warp simulating viewing angle.
+    strength: max fractional shift of corners (0.15 = ±15% of image size).
+    Uses PIL's transform with PERSPECTIVE coefficients.
+    """
+    w, h = img.size
+    # Original corners: TL, TR, BR, BL
+    orig = [0, 0,  w, 0,  w, h,  0, h]
+
+    def jitter(v, axis_size):
+        return v + random.uniform(-strength, strength) * axis_size
+
+    # Randomise each corner independently but keep it a valid quadrilateral
+    # by constraining the shift so corners don't cross
+    s = strength * 0.7   # slightly tighter to keep sign readable
+    new_corners = [
+        jitter(0, w), jitter(0, h),   # TL
+        jitter(w, w), jitter(0, h),   # TR
+        jitter(w, w), jitter(h, h),   # BR
+        jitter(0, w), jitter(h, h),   # BL
+    ]
+
+    # Compute perspective coefficients (8-point, PIL convention)
+    # Solving: dst = M * src  →  find M
+    def _find_coeffs(pa, pb):
+        matrix = []
+        for p1, p2 in zip(pa, pb):
+            matrix.append([p1[0], p1[1], 1, 0, 0, 0, -p2[0]*p1[0], -p2[0]*p1[1]])
+            matrix.append([0, 0, 0, p1[0], p1[1], 1, -p2[1]*p1[0], -p2[1]*p1[1]])
+        A = np.matrix(matrix, dtype=np.float64)
+        B = np.array([p[i] for p in pb for i in range(2)], dtype=np.float64)
+        res = np.linalg.solve(A, B)
+        return np.array(res).flatten()
+
+    src = [(orig[i], orig[i+1]) for i in range(0, 8, 2)]
+    dst = [(new_corners[i], new_corners[i+1]) for i in range(0, 8, 2)]
+
+    try:
+        coeffs = _find_coeffs(dst, src)   # PIL warps destination→source
+        return img.transform(
+            (w, h), Image.PERSPECTIVE, coeffs,
+            resample=Image.BILINEAR,
+        )
+    except np.linalg.LinAlgError:
+        return img   # degenerate — skip warp
+
+
 # ── sign renderer ─────────────────────────────────────────────────────────────
 
 def render_au_sign(
     speed: int,
     canvas_size: int = 224,
     sign_fraction: float = 0.80,
-    aging: float = 0.0,          # 0.0 = pristine, 1.0 = heavily weathered
+    aging: float = 0.0,
 ) -> Image.Image:
     """
     Render one Australian speed-limit sign on a transparent background.
     Returns RGBA PIL image of size (canvas_size × canvas_size).
-
-    AU signs: white circle, red border ring, regular-weight black number only.
-    No "km/h" text — that is a European convention, not used in Australia.
-
-    aging: adds yellowing, scratches, fading to simulate real-world wear.
     """
     size = canvas_size
     img  = Image.new("RGBA", (size, size), (0, 0, 0, 0))
@@ -89,15 +129,14 @@ def render_au_sign(
     draw.ellipse([cx - r, cy - r, cx + r, cy + r],
                  outline=_RED + (255,), width=ring_w)
 
-    # ── number — centred, regular weight ──
+    # Number
     label   = str(speed)
     n_chars = len(label)
-
     if n_chars == 1:
         num_frac = 0.52
     elif n_chars == 2:
         num_frac = 0.46
-    else:   # 3 digits (110)
+    else:
         num_frac = 0.34
 
     num_font = _load_font(int(size * num_frac))
@@ -108,13 +147,11 @@ def render_au_sign(
         label, fill=_BLACK + (255,), font=num_font,
     )
 
-    # ── aging / weathering ──
+    # Aging / weathering
     if aging > 0:
         arr = np.array(img, dtype=np.float32)
-        # yellowing: push towards warm tint
         arr[:, :, 0] = np.clip(arr[:, :, 0] + aging * 20, 0, 255)
         arr[:, :, 2] = np.clip(arr[:, :, 2] - aging * 15, 0, 255)
-        # random scratches (thin dark lines)
         n_scratches = int(aging * 8)
         for _ in range(n_scratches):
             x0 = random.randint(0, size)
@@ -125,7 +162,6 @@ def render_au_sign(
             sd = ImageDraw.Draw(scratch_img)
             sd.line([x0, y0, x1, y1], fill=(80, 80, 80, 200), width=1)
             arr = np.array(scratch_img, dtype=np.float32)
-        # fading: reduce saturation
         grey = arr[:, :, :3].mean(axis=2, keepdims=True)
         arr[:, :, :3] = arr[:, :, :3] * (1 - aging * 0.2) + grey * (aging * 0.2)
         img = Image.fromarray(arr.astype(np.uint8), "RGBA")
@@ -136,7 +172,6 @@ def render_au_sign(
 # ── background generators ─────────────────────────────────────────────────────
 
 def _bg_sky(size: int) -> Image.Image:
-    """Blue-grey overcast sky typical of Australian weather."""
     arr = np.zeros((size, size, 3), dtype=np.uint8)
     for y in range(size):
         t = y / size
@@ -144,62 +179,64 @@ def _bg_sky(size: int) -> Image.Image:
         g = int(160 + 50 * t + random.uniform(-5, 5))
         b = int(185 + 40 * t + random.uniform(-5, 5))
         arr[y, :] = [r, g, b]
-    # cloud noise
     noise = np.random.randint(0, 20, (size, size, 3), dtype=np.uint8)
     arr = np.clip(arr.astype(int) + noise - 10, 0, 255).astype(np.uint8)
     return Image.fromarray(arr, "RGB")
 
 
 def _bg_concrete(size: int) -> Image.Image:
-    """Grey concrete / bitumen — carpark floor colour."""
-    base  = random.randint(100, 160)
-    noise = np.random.normal(0, 12, (size, size, 3))
+    base  = random.randint(80, 170)   # wider range than before
+    noise = np.random.normal(0, 15, (size, size, 3))
     arr   = np.clip(base + noise, 0, 255).astype(np.uint8)
     return Image.fromarray(arr, "RGB")
 
 
 def _bg_vegetation(size: int) -> Image.Image:
-    """Green-brown vegetation blob — typical roadside."""
     arr = np.zeros((size, size, 3), dtype=np.uint8)
     for y in range(size):
         t = y / size
-        arr[y, :] = [
-            int(50  + 40  * t),
-            int(90  + 60  * t),
-            int(30  + 20  * t),
-        ]
+        arr[y, :] = [int(50 + 40*t), int(90 + 60*t), int(30 + 20*t)]
     noise = np.random.randint(0, 30, (size, size, 3), dtype=np.uint8)
     arr   = np.clip(arr.astype(int) + noise, 0, 255).astype(np.uint8)
     return Image.fromarray(arr, "RGB")
 
 
 def _bg_night(size: int) -> Image.Image:
-    """Dark night with carpark-style artificial lighting blob."""
     arr = np.random.randint(5, 30, (size, size, 3), dtype=np.uint8)
-    # central warm light blob
     cx = cy = size / 2
     sigma = size * 0.4
     for y in range(size):
         for x in range(size):
-            d2 = ((x - cx) ** 2 + (y - cy) ** 2) / (sigma ** 2)
+            d2 = ((x - cx)**2 + (y - cy)**2) / (sigma**2)
             glow = int(120 * math.exp(-d2))
             arr[y, x] = np.clip(
-                arr[y, x] + np.array([glow, int(glow * 0.85), int(glow * 0.6)]),
+                arr[y, x] + np.array([glow, int(glow*0.85), int(glow*0.6)]),
                 0, 255,
             )
     return Image.fromarray(arr, "RGB")
 
 
 def _bg_white(size: int) -> Image.Image:
-    """Clean white — for dataset variety / ablation."""
-    val = random.randint(220, 255)
+    val = random.randint(200, 255)
     arr = np.full((size, size, 3), val, dtype=np.uint8)
     return Image.fromarray(arr, "RGB")
 
 
-_BG_GENERATORS = [_bg_sky, _bg_concrete, _bg_vegetation, _bg_night, _bg_white]
+def _bg_wall(size: int) -> Image.Image:
+    """Concrete/brick wall — common carpark background."""
+    base  = random.randint(120, 200)
+    tint  = random.choice([(1.0, 0.95, 0.90), (0.95, 0.95, 1.0), (1.0, 1.0, 1.0)])
+    noise = np.random.normal(0, 18, (size, size, 3))
+    arr   = np.clip(base + noise, 0, 255).astype(np.uint8)
+    arr   = (arr * np.array(tint)).clip(0, 255).astype(np.uint8)
+    # Horizontal mortar lines
+    for y in range(0, size, random.randint(18, 32)):
+        arr[max(0, y-1):y+1, :] = np.clip(arr[max(0, y-1):y+1, :].astype(int) - 30, 0, 255)
+    return Image.fromarray(arr, "RGB")
 
-_BG_WEIGHTS = [0.20, 0.35, 0.15, 0.20, 0.10]   # carpark-heavy: more concrete/night
+
+_BG_GENERATORS = [_bg_sky, _bg_concrete, _bg_vegetation, _bg_night, _bg_white, _bg_wall]
+_BG_WEIGHTS    = [0.15,    0.30,          0.10,           0.20,      0.10,      0.15]
 
 
 def random_background(size: int) -> Image.Image:
@@ -220,29 +257,37 @@ def composite_sign(
 
     Randomises:
       - background type and texture
-      - sign position (±8% of canvas)
-      - sign scale (±5%)
-      - sign rotation (±6°)
+      - sign position (±12% of canvas)
+      - sign scale (±20%)          ← wider than before
+      - sign rotation (±10°)       ← wider than before
+      - perspective warp (±12%)    ← NEW
       - aging level
+      - motion blur                ← NEW
+      - brightness/contrast        ← NEW wider range
+      - JPEG-style compression     ← NEW
     """
     if aging is None:
-        aging = random.uniform(0.0, 0.4)
+        aging = random.uniform(0.0, 0.5)
 
     bg = random_background(canvas_size)
 
-    scale  = random.uniform(0.90, 1.05)
-    s_size = int(canvas_size * scale)
-    sign_rgba = render_au_sign(
-        speed, canvas_size=s_size, aging=aging,
-    )
+    # Scale: ±20% (was ±5%)
+    scale  = random.uniform(0.80, 1.20)
+    s_size = max(32, int(canvas_size * scale))
+    sign_rgba = render_au_sign(speed, canvas_size=s_size, aging=aging)
 
-    # rotate
-    angle = random.uniform(-6, 6)
+    # Rotation: ±10° (was ±6°)
+    angle = random.uniform(-10, 10)
     sign_rgba = sign_rgba.rotate(angle, resample=Image.BILINEAR, expand=False)
 
-    # position jitter
+    # Perspective warp — applied to sign before compositing
+    if random.random() < 0.6:   # 60% of images get perspective warp
+        warp_strength = random.uniform(0.05, 0.15)
+        sign_rgba = _perspective_warp(sign_rgba, strength=warp_strength)
+
+    # Position jitter: ±12% (was ±8%)
     if jitter_pos:
-        max_off = int(canvas_size * 0.08)
+        max_off = int(canvas_size * 0.12)
         ox = random.randint(-max_off, max_off)
         oy = random.randint(-max_off, max_off)
     else:
@@ -253,10 +298,39 @@ def composite_sign(
 
     bg.paste(sign_rgba, (paste_x, paste_y), mask=sign_rgba.split()[3])
 
-    # slight overall blur (simulate camera defocus at distance)
-    if random.random() < 0.3:
-        radius = random.uniform(0.3, 1.2)
+    # Defocus blur (wider range)
+    if random.random() < 0.35:
+        radius = random.uniform(0.3, 2.0)
         bg = bg.filter(ImageFilter.GaussianBlur(radius=radius))
+
+    # Motion blur — horizontal smear simulating car movement
+    if random.random() < 0.25:
+        blur_px = random.randint(2, 6)
+        kernel  = np.zeros((blur_px, blur_px))
+        kernel[blur_px // 2, :] = 1.0 / blur_px
+        from PIL import ImageFilter as _IF
+        bg = bg.filter(_IF.Kernel(
+            size=(blur_px, blur_px),
+            kernel=kernel.flatten().tolist(),
+            scale=1, offset=0,
+        )) if blur_px <= 5 else bg.filter(ImageFilter.GaussianBlur(radius=1.5))
+
+    # Brightness / contrast variation (wider than default)
+    arr = np.array(bg, dtype=np.float32)
+    brightness = random.uniform(0.55, 1.45)   # was implicitly ~1.0
+    contrast   = random.uniform(0.75, 1.35)
+    mean       = arr.mean()
+    arr        = (arr - mean) * contrast + mean * brightness
+    arr        = np.clip(arr, 0, 255).astype(np.uint8)
+    bg         = Image.fromarray(arr, "RGB")
+
+    # JPEG compression artefacts (simulate camera encoding)
+    if random.random() < 0.30:
+        import io
+        buf = io.BytesIO()
+        bg.save(buf, format="JPEG", quality=random.randint(55, 85))
+        buf.seek(0)
+        bg = Image.open(buf).copy()
 
     return bg
 
@@ -267,12 +341,8 @@ def generate_dataset(
     out_dir: str,
     n_per_class: int = 400,
     canvas_size: int = 224,
-    speeds: list[int] = None,
+    speeds: list = None,
 ):
-    """
-    Write n_per_class images per speed to out_dir/<speed>/XXXXX.png.
-    Directory structure mirrors torchvision ImageFolder convention.
-    """
     if speeds is None:
         speeds = AU_SPEEDS
 
@@ -303,7 +373,6 @@ def generate_dataset(
 # ── preview helper ────────────────────────────────────────────────────────────
 
 def save_preview(out_path: str = "aus_preview.png", n_cols: int = 7):
-    """Save a grid showing all speed classes with various backgrounds."""
     speeds = AU_SPEEDS
     n_rows = math.ceil(len(speeds) / n_cols)
     cell   = 224
