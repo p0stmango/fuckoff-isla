@@ -7,12 +7,16 @@ Bootstrap path (first run, ~15 min on M5 Pro):
 Subsequent runs load surrogate.pt directly — no internet required.
 
 Architecture:
-    GTSRBSurrogate = ResNet-18 backbone (43-class GTSRB head)
+    GTSRBSurrogate = backbone (43-class GTSRB head)
                    + linear remapping head (43 → NUM_CLASSES AU speeds)
+
+Supported backbones (ARCH_CHOICES):
+    resnet18, resnet50               — strong baseline, GTSRB pretrain supported
+    mobilenet_v3_small/large         — closest proxy for embedded ADAS (EyeQ4-like)
+    efficientnet_b0                  — different feature hierarchy, good ensemble diversity
 
 The remapping head is identity-initialised for overlapping GTSRB/AU classes
 and zero-initialised for AU-only classes (5/10/15/25/40/90/110 km/h).
-Those learn during fine-tuning on AU synthetic data.
 """
 import torch
 import torch.nn as nn
@@ -36,13 +40,22 @@ GTSRB_TO_AU_LABEL: dict[int, int] = {
     for g, kmh in GTSRB_43_SPEED_MAP.items()
 }
 
+ARCH_CHOICES = [
+    "resnet18",
+    "resnet50",
+    "mobilenet_v3_small",
+    "mobilenet_v3_large",
+    "efficientnet_b0",
+]
+
 
 # ── Model ─────────────────────────────────────────────────────────────────────
 
 class GTSRBSurrogate(nn.Module):
     """
-    ResNet-18/50 backbone (43-class GTSRB output) with a learnable linear head
-    that maps 43 GTSRB logits → NUM_CLASSES AU speed logits.
+    Backbone (43-class GTSRB output) with a learnable linear head that maps
+    43 GTSRB logits → NUM_CLASSES AU speed logits.  Works for any backbone
+    in ARCH_CHOICES.
     """
 
     def __init__(self, backbone: nn.Module, gtsrb_out: int = GTSRB_N_CLASSES):
@@ -69,6 +82,40 @@ class GTSRBSurrogate(nn.Module):
             p.requires_grad = True
 
 
+# ── Backbone factory ──────────────────────────────────────────────────────────
+
+def _build_backbone(arch: str, pretrained: bool = True) -> nn.Module:
+    """
+    Build a backbone with GTSRB_N_CLASSES output head.
+    pretrained=True loads ImageNet weights; False gives a bare skeleton for
+    loading a saved checkpoint (the final layer is still replaced so the
+    state dict shapes match).
+    """
+    if arch == "resnet18":
+        weights = tvm.ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
+        m = tvm.resnet18(weights=weights)
+        m.fc = nn.Linear(m.fc.in_features, GTSRB_N_CLASSES)
+    elif arch == "resnet50":
+        weights = tvm.ResNet50_Weights.IMAGENET1K_V1 if pretrained else None
+        m = tvm.resnet50(weights=weights)
+        m.fc = nn.Linear(m.fc.in_features, GTSRB_N_CLASSES)
+    elif arch == "mobilenet_v3_small":
+        weights = tvm.MobileNet_V3_Small_Weights.IMAGENET1K_V1 if pretrained else None
+        m = tvm.mobilenet_v3_small(weights=weights)
+        m.classifier[-1] = nn.Linear(m.classifier[-1].in_features, GTSRB_N_CLASSES)
+    elif arch == "mobilenet_v3_large":
+        weights = tvm.MobileNet_V3_Large_Weights.IMAGENET1K_V1 if pretrained else None
+        m = tvm.mobilenet_v3_large(weights=weights)
+        m.classifier[-1] = nn.Linear(m.classifier[-1].in_features, GTSRB_N_CLASSES)
+    elif arch == "efficientnet_b0":
+        weights = tvm.EfficientNet_B0_Weights.IMAGENET1K_V1 if pretrained else None
+        m = tvm.efficientnet_b0(weights=weights)
+        m.classifier[-1] = nn.Linear(m.classifier[-1].in_features, GTSRB_N_CLASSES)
+    else:
+        raise ValueError(f"Unknown arch '{arch}'. Choose from: {ARCH_CHOICES}")
+    return m
+
+
 # ── Local GTSRB pretrain ──────────────────────────────────────────────────────
 
 def _pretrain_on_gtsrb(
@@ -80,9 +127,10 @@ def _pretrain_on_gtsrb(
     save_path: str = "./gtsrb_backbone.pt",
 ) -> nn.Module:
     """
-    Train a ResNet on torchvision GTSRB from ImageNet weights.
+    Train a backbone on torchvision GTSRB from ImageNet weights.
     Saves the backbone state dict to save_path and returns the model.
-    ~15 min on M5 Pro, one-time cost.
+    ~15 min on M5 Pro, one-time cost.  ResNets recommended; other archs work
+    but are not tuned for the 64×64 training resolution used here.
     """
     device = get_device()
     print(f"Pretraining {arch} on GTSRB ({epochs} epochs) → {save_path}")
@@ -105,12 +153,7 @@ def _pretrain_on_gtsrb(
     train_loader = DataLoader(train_ds, batch_size=batch, shuffle=True,  num_workers=0)
     val_loader   = DataLoader(val_ds,   batch_size=batch, shuffle=False, num_workers=0)
 
-    if arch == "resnet18":
-        model = tvm.resnet18(weights=tvm.ResNet18_Weights.IMAGENET1K_V1)
-    else:
-        model = tvm.resnet50(weights=tvm.ResNet50_Weights.IMAGENET1K_V1)
-    model.fc = nn.Linear(model.fc.in_features, GTSRB_N_CLASSES)
-    model = model.to(device)
+    model = _build_backbone(arch, pretrained=True).to(device)
 
     opt  = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
@@ -153,27 +196,21 @@ def build_surrogate(
     pretrain_path: str  = "./gtsrb_backbone.pt",
     pretrain_epochs: int = 5,
     data_root:     str  = "./data",
-    # legacy kwargs silently accepted so old callers don't crash
     **_kwargs,
 ) -> GTSRBSurrogate:
     """
-    Build a GTSRBSurrogate.
+    Build a GTSRBSurrogate for any arch in ARCH_CHOICES.
 
     Priority:
       1. Load cached backbone from pretrain_path (fast, no internet)
       2. Run local GTSRB pretrain if pretrain=True (one-time, ~15 min)
-      3. Fall back to random ImageNet weights (will still fine-tune OK)
+      3. Fall back to ImageNet weights (will still provide useful features)
     """
     import os
 
-    if arch == "resnet18":
-        backbone = tvm.resnet18(weights=None)
-    else:
-        backbone = tvm.resnet50(weights=None)
-    backbone.fc = nn.Linear(backbone.fc.in_features, GTSRB_N_CLASSES)
-
     if os.path.exists(pretrain_path):
         print(f"Loading GTSRB backbone from cache: {pretrain_path}")
+        backbone = _build_backbone(arch, pretrained=False)
         state = torch.load(pretrain_path, map_location="cpu", weights_only=True)
         backbone.load_state_dict(state)
     elif pretrain:
@@ -182,15 +219,11 @@ def build_surrogate(
             data_root=data_root, save_path=pretrain_path,
         )
     else:
-        print("No pretrain cache found and --pretrain-gtsrb not set — using ImageNet init.")
-        if arch == "resnet18":
-            backbone = tvm.resnet18(weights=tvm.ResNet18_Weights.IMAGENET1K_V1)
-        else:
-            backbone = tvm.resnet50(weights=tvm.ResNet50_Weights.IMAGENET1K_V1)
-        backbone.fc = nn.Linear(backbone.fc.in_features, GTSRB_N_CLASSES)
+        print(f"No pretrain cache — using ImageNet init for {arch}.")
+        backbone = _build_backbone(arch, pretrained=True)
 
     model = GTSRBSurrogate(backbone, gtsrb_out=GTSRB_N_CLASSES)
-    print(f"Surrogate ready: {NUM_CLASSES} AU classes → {ALL_SPEEDS}")
+    print(f"Surrogate ready [{arch}]: {NUM_CLASSES} AU classes → {ALL_SPEEDS}")
     return model
 
 
@@ -210,15 +243,10 @@ def save(model: nn.Module, path: str):
 
 def load(path: str, arch: str = "resnet18") -> GTSRBSurrogate:
     """
-    Load a saved surrogate checkpoint.
-    Builds a bare skeleton (no pretrained weights needed) and loads the state dict.
-    surrogate.pt contains everything — no internet access required.
+    Load a saved surrogate checkpoint (full GTSRBSurrogate state dict).
+    Works for any arch in ARCH_CHOICES — pass the same arch used when saving.
     """
-    if arch == "resnet18":
-        backbone = tvm.resnet18(weights=None)
-    else:
-        backbone = tvm.resnet50(weights=None)
-    backbone.fc = nn.Linear(backbone.fc.in_features, GTSRB_N_CLASSES)
+    backbone = _build_backbone(arch, pretrained=False)
     model = GTSRBSurrogate(backbone, gtsrb_out=GTSRB_N_CLASSES)
     state = torch.load(path, map_location="cpu", weights_only=True)
     model.load_state_dict(state)

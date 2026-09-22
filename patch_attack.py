@@ -31,7 +31,7 @@ from dataset import (
     AUSynthDataset, FilteredGTSRB, val_transforms, NORMALIZE,
     KMH_TO_LABEL, ALL_SPEEDS, IMG_SIZE, NUM_CLASSES,
 )
-from model import build_surrogate, get_device, load as load_model
+from model import build_surrogate, get_device, load as load_model, ARCH_CHOICES
 from eot import eot_batch
 
 # ── denormalise helper ───────────────────────────────────────────────────────
@@ -152,7 +152,7 @@ def printability_loss(patch_01: torch.Tensor,
 # ── optimisation loop ────────────────────────────────────────────────────────
 
 def optimise_patch(
-    model:        torch.nn.Module,
+    models:       list,
     dataset:      torch.utils.data.Dataset,
     target_label: int,
     patch_size:   int   = 80,
@@ -191,6 +191,13 @@ def optimise_patch(
     target_patch_px = max(4, int(sign_input_px * patch_mm / sign_diam_mm))
     print(f"Print-res patch : {patch_size}px  ({print_cm}cm @ 300 DPI)")
     print(f"Model footprint : {target_patch_px}px  in 224px input")
+    print(f"Ensemble size   : {len(models)} model(s): "
+          f"{[getattr(m, '_arch_name', '?') for m in models]}")
+
+    for m in models:
+        m.eval()
+        for p in m.parameters():
+            p.requires_grad = False
 
     patch_01 = torch.rand(1, 3, patch_size, patch_size, device=device) * 0.5 + 0.25
     patch_01.requires_grad_(True)
@@ -233,13 +240,16 @@ def optimise_patch(
         total_loss = torch.tensor(0.0, device=device)
 
         for _ in range(eot_samples):
+            # Sample one surrogate per EOT step — prevents the patch from
+            # exploiting any single model's blind spots.
+            surrogate = random.choice(models)
             patched     = apply_patch(imgs, patch_norm, randomise_placement=True,
                                       target_patch_px=target_patch_px)
             patched_01  = patched * std + mean
             patched_01  = eot_batch(patched_01.clone())
             patched_eot = (patched_01 - mean) / std
 
-            logits = model(patched_eot)
+            logits = surrogate(patched_eot)
             loss   = F.cross_entropy(logits, target_t.expand(B))
             total_loss = total_loss + loss
 
@@ -269,8 +279,11 @@ def optimise_patch(
                 patched_01_log  = patched_log * std + mean
                 patched_01_log  = eot_batch(patched_01_log)
                 patched_eot_log = (patched_01_log - mean) / std
-                preds = model(patched_eot_log).argmax(1)
-                asr   = (preds == target_label).float().mean().item()
+                # Report ASR as the worst-case (minimum) across all surrogates
+                asr = min(
+                    (m(patched_eot_log).argmax(1) == target_label).float().mean().item()
+                    for m in models
+                )
             pbar.set_postfix(loss=f"{total_loss.item():.4f}", ASR=f"{asr:.2%}")
 
             arr = patch_01.detach().clamp(0, 1).squeeze(0).permute(1, 2, 0).cpu().numpy()
@@ -297,7 +310,7 @@ def save_patch_png(patch_01: torch.Tensor, path: str, print_cm: float = 8.0):
 # ── evaluate ──────────────────────────────────────────────────────────────────
 
 def evaluate_patch(
-    model:           torch.nn.Module,
+    models:          list,
     dataset:         torch.utils.data.Dataset,
     patch_01:        torch.Tensor,
     target_label:    int,
@@ -306,6 +319,10 @@ def evaluate_patch(
     batch_size:      int   = 64,
     n_eot:           int   = 16,
 ):
+    """
+    Evaluate ASR independently on each surrogate so you can see per-arch
+    transfer, then report the ensemble (worst-case) figure.
+    """
     if device is None:
         device = get_device()
 
@@ -317,47 +334,78 @@ def evaluate_patch(
         dataset, batch_size=batch_size, shuffle=False, num_workers=0,
     )
 
-    model.eval()
-    total = correct_target = originally_correct = 0
+    for m in models:
+        m.eval()
+
+    n_models = len(models)
+    totals           = [0] * n_models
+    correct_targets  = [0] * n_models
+    orig_correct     = [0] * n_models
+
     with torch.no_grad():
         for imgs, labels in loader:
             imgs, labels = imgs.to(device), labels.to(device)
+            B = imgs.size(0)
 
-            clean_preds = model(imgs).argmax(1)
-            originally_correct += (clean_preds == labels).sum().item()
+            for mi, m in enumerate(models):
+                orig_correct[mi] += (m(imgs).argmax(1) == labels).sum().item()
 
-            eot_votes = torch.zeros(imgs.size(0), dtype=torch.long, device=device)
-            for _ in range(n_eot):
-                patched     = apply_patch(imgs, patch_norm, randomise_placement=True,
-                                          target_patch_px=target_patch_px)
-                patched_01  = patched * std + mean
-                patched_01  = eot_batch(patched_01)
-                patched_eot = (patched_01 - mean) / std
-                preds       = model(patched_eot).argmax(1)
-                eot_votes  += (preds == target_label).long()
+                eot_votes = torch.zeros(B, dtype=torch.long, device=device)
+                for _ in range(n_eot):
+                    patched     = apply_patch(imgs, patch_norm, randomise_placement=True,
+                                              target_patch_px=target_patch_px)
+                    patched_01  = patched * std + mean
+                    patched_01  = eot_batch(patched_01)
+                    patched_eot = (patched_01 - mean) / std
+                    preds       = m(patched_eot).argmax(1)
+                    eot_votes  += (preds == target_label).long()
 
-            correct_target += (eot_votes >= (n_eot // 2 + 1)).sum().item()
-            total          += imgs.size(0)
+                correct_targets[mi] += (eot_votes >= (n_eot // 2 + 1)).sum().item()
+                totals[mi]          += B
 
     print(f"\n── Patch Evaluation (EOT + random placement) ──")
-    print(f"Total samples       : {total}")
-    print(f"Clean accuracy      : {originally_correct/total:.2%}")
-    print(f"Attack success rate : {correct_target/total:.2%}  "
-          f"(target={ALL_SPEEDS[target_label]} km/h, majority vote over {n_eot} EOT samples)")
+    arch_names = [getattr(m, '_arch_name', f'model_{i}') for i, m in enumerate(models)]
+    for mi, name in enumerate(arch_names):
+        T = totals[mi]
+        print(f"  [{name:22s}]  clean={orig_correct[mi]/T:.2%}  "
+              f"ASR={correct_targets[mi]/T:.2%}")
+
+    worst_asr = min(correct_targets[mi] / totals[mi] for mi in range(n_models))
+    print(f"  Worst-case (ensemble) ASR : {worst_asr:.2%}  "
+          f"(target={ALL_SPEEDS[target_label]} km/h, majority vote {n_eot} EOT)")
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
+
+def _load_or_build(model_path: str, arch: str, pretrain_path: str, device) -> torch.nn.Module:
+    if Path(model_path).exists():
+        m = load_model(model_path, arch=arch).to(device)
+        print(f"  Loaded {arch} from {model_path}")
+    else:
+        print(f"  No checkpoint at {model_path} — building from pretrain")
+        m = build_surrogate(arch=arch, pretrain_path=pretrain_path).to(device)
+    m._arch_name = arch
+    return m
+
 
 def main(args):
     device = get_device()
     print(f"Device: {device}")
 
-    if Path(args.model).exists():
-        model = load_model(args.model, arch=args.arch).to(device)
-        print(f"Loaded surrogate from {args.model}")
-    else:
-        print(f"No checkpoint at {args.model} — building from pretrain")
-        model = build_surrogate(arch=args.arch, pretrain_path=args.pretrain_path).to(device)
+    # Build ensemble — one surrogate per requested arch.
+    # --arch accepts a comma-separated list, e.g. "resnet18,mobilenet_v3_small"
+    arch_list = [a.strip() for a in args.arch.split(",")]
+    ensemble = []
+    for arch in arch_list:
+        # Each arch gets its own checkpoint file derived from --model, e.g.
+        # surrogate_mobilenet_v3_small.pt alongside surrogate.pt.
+        stem   = Path(args.model).stem
+        suffix = Path(args.model).suffix
+        arch_path = str(Path(args.model).parent / f"{stem}_{arch}{suffix}") \
+                    if arch != arch_list[0] else args.model
+        ensemble.append(_load_or_build(arch_path, arch, args.pretrain_path, device))
+
+    print(f"Ensemble: {[m._arch_name for m in ensemble]}")
 
     from torch.utils.data import ConcatDataset
     gtsrb_val = FilteredGTSRB(args.data, split="test", transform=val_transforms, download=False)
@@ -369,7 +417,7 @@ def main(args):
     print(f"Target: {args.target} km/h  (label {target_label})")
 
     patch_01, target_patch_px = optimise_patch(
-        model        = model,
+        models       = ensemble,
         dataset      = val_ds,
         target_label = target_label,
         patch_size   = args.patch_size,
@@ -390,7 +438,7 @@ def main(args):
     png_path = Path(args.out).with_suffix(".png")
     save_patch_png(patch_01.cpu(), str(png_path), print_cm=args.print_cm)
 
-    evaluate_patch(model, val_ds, patch_01, target_label,
+    evaluate_patch(ensemble, val_ds, patch_01, target_label,
                    target_patch_px=target_patch_px, device=device, n_eot=args.eot_samples)
 
 
@@ -398,7 +446,9 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--model",         default="surrogate.pt")
     p.add_argument("--pretrain-path", default="./gtsrb_backbone.pt")
-    p.add_argument("--arch",          default="resnet18", choices=["resnet18", "resnet50"])
+    p.add_argument("--arch",          default="resnet18",
+                   help=f"Comma-separated list of architectures for ensemble. "
+                        f"Choices: {','.join(ARCH_CHOICES)}")
     p.add_argument("--data",          default="./data")
     p.add_argument("--aus-data",      default="./data/aus_synth")
     p.add_argument("--out",           default="patch.pt")
