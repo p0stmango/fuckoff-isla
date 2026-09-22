@@ -510,7 +510,14 @@ def apply_grayscale(x: torch.Tensor) -> torch.Tensor:
     """
     gray = 0.299 * x[:, 0:1] + 0.587 * x[:, 1:2] + 0.114 * x[:, 2:3]
     return gray.expand_as(x).contiguous()
-
+import cv2, numpy as np
+def apply_clahe(x):
+    # x: (1, 3, H, W) tensor in [0,1], already grayscale-converted
+    arr = (x.squeeze(0).permute(1,2,0).cpu().numpy() * 255).astype(np.uint8)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4,4))
+    out = clahe.apply(arr[:,:,0])  # grayscale channel
+    out3 = np.stack([out]*3, axis=2).astype(np.float32) / 255.
+    return torch.from_numpy(out3).permute(2,0,1).unsqueeze(0).to(x.device)
 # ════════════════════════════════════════════════════════════════════════════
 # EOT APPLICATION
 # ════════════════════════════════════════════════════════════════════════════
@@ -586,4 +593,5 @@ def eot_batch(x: torch.Tensor, n_transforms: int = 3) -> torch.Tensor:
 
     # ── monochrome sensor (always last — Mobileye S-Cam4 is grayscale) ──────
     x = apply_grayscale(x)
+    x = apply_clahe(x)
     return torch.clamp(x, 0.0, 1.0)
