@@ -47,21 +47,37 @@ def denormalize(t: torch.Tensor) -> torch.Tensor:
 
 def apply_patch(
     images: torch.Tensor,          # (B, 3, H, W)  normalised
-    patch_norm: torch.Tensor,      # (1, 3, P, P)  normalised patch
+    patch_norm: torch.Tensor,      # (1, 3, P, P)  normalised patch — may be print-res
     cx_frac: float = 0.5,
     cy_frac: float = 0.5,
     randomise_placement: bool = False,
+    target_patch_px: int = None,   # if set, downsample patch to this size first
 ) -> torch.Tensor:
     """
     Place the rectangular patch centred at (cx_frac, cy_frac).
     No circular mask — full rectangle is applied.
-    randomise_placement jitters position within the inner sign face.
+
+    target_patch_px: the patch footprint in the model's input space (px).
+    When patch_norm is at print resolution (e.g. 945px) and the model sees
+    224px images, pass target_patch_px=32 to downsample through a
+    differentiable bilinear interpolation before compositing.  Gradients
+    flow back through the interpolation to update the full-res patch tensor.
     """
     B, C, H, W = images.shape
-    P = patch_norm.shape[-1]
+
+    # Downsample print-res patch to model input footprint (differentiable)
+    if target_patch_px is not None and patch_norm.shape[-1] != target_patch_px:
+        patch_small = F.interpolate(
+            patch_norm, size=(target_patch_px, target_patch_px),
+            mode="bilinear", align_corners=False,
+        )
+    else:
+        patch_small = patch_norm
+
+    P = patch_small.shape[-1]
 
     patched     = images.clone()
-    patch_tiled = patch_norm.expand(B, -1, -1, -1)
+    patch_tiled = patch_small.expand(B, -1, -1, -1)
 
     if not randomise_placement:
         top  = max(0, min(int(cy_frac * H - P / 2), H - P))
@@ -90,13 +106,36 @@ def optimise_patch(
     batch_size:   int   = 32,
     device:       torch.device = None,
     universal:    bool  = True,
+    print_cm:     float = 8.0,
+    sign_diam_mm: float = 190.0,
+    real_sign_mm: float = 450.0,
 ) -> torch.Tensor:
+    """
+    patch_size is the PRINT resolution of the patch (e.g. 945 = 8cm @ 300 DPI).
+    During optimisation it is downsampled via bilinear interpolation to the
+    correct footprint in the 224px model input, so gradients flow through the
+    resize back to the full-res tensor.  What you optimise is literally what
+    you print — no separate upscale step.
+    """
     if device is None:
         device = get_device()
 
     model.eval()
     for p in model.parameters():
         p.requires_grad = False
+
+    # Compute patch footprint in model input space (224px)
+    # Sign occupies sign_diam_mm/real_sign_mm of the real sign diameter.
+    # In the model input (224px) the sign fills ~80% = 179px.
+    patch_mm        = print_cm * 10.0
+    patch_frac      = patch_mm / real_sign_mm          # fraction of real sign diam
+    sign_input_px   = int(224 * 0.80)                  # ~179px sign in 224px input
+    target_patch_px = max(4, int(sign_input_px * patch_frac * (sign_diam_mm / real_sign_mm)))
+    # Simpler direct calculation: patch covers patch_mm of the 190mm rendered sign
+    # which fills 179px → patch_px = 179 * patch_mm / 190
+    target_patch_px = max(4, int(sign_input_px * patch_mm / sign_diam_mm))
+    print(f"Print-res patch : {patch_size}px  ({print_cm}cm @ 300 DPI)")
+    print(f"Model footprint : {target_patch_px}px  in 224px input")
 
     patch_01 = torch.rand(1, 3, patch_size, patch_size, device=device) * 0.5 + 0.25
     patch_01.requires_grad_(True)
@@ -141,7 +180,8 @@ def optimise_patch(
         total_loss = torch.tensor(0.0, device=device)
 
         for _ in range(eot_samples):
-            patched = apply_patch(imgs, patch_norm, randomise_placement=True)
+            patched = apply_patch(imgs, patch_norm, randomise_placement=True,
+                                  target_patch_px=target_patch_px)
             patched_01  = patched * std + mean
             patched_01  = eot_batch(patched_01.clone())
             patched_eot = (patched_01 - mean) / std
@@ -163,7 +203,8 @@ def optimise_patch(
         if step % 50 == 0:
             with torch.no_grad():
                 patch_norm_det  = to_normalised(patch_01.detach().clamp(0, 1))
-                patched_log     = apply_patch(imgs, patch_norm_det, randomise_placement=True)
+                patched_log     = apply_patch(imgs, patch_norm_det, randomise_placement=True,
+                                              target_patch_px=target_patch_px)
                 patched_01_log  = patched_log * std + mean
                 patched_01_log  = eot_batch(patched_01_log)
                 patched_eot_log = (patched_01_log - mean) / std
@@ -174,33 +215,36 @@ def optimise_patch(
             arr = patch_01.detach().clamp(0, 1).squeeze(0).permute(1, 2, 0).cpu().numpy()
             Image.fromarray((arr * 255).astype(np.uint8)).save(f"patch_step_{step:04d}.png")
 
-    return patch_01.detach().clamp(0, 1)
+    return patch_01.detach().clamp(0, 1), target_patch_px
 
 
 # ── export ────────────────────────────────────────────────────────────────────
 
 def save_patch_png(patch_01: torch.Tensor, path: str, print_cm: float = 8.0):
+    """Patch tensor is already at print resolution — save directly, no upscale."""
     arr = patch_01.squeeze(0).permute(1, 2, 0).numpy()
     arr = (arr * 255).clip(0, 255).astype(np.uint8)
     img = Image.fromarray(arr)
     dpi = 300
     px  = int(print_cm / 2.54 * dpi)
-    img_high = img.resize((px, px), resample=Image.LANCZOS)
-    img_high.save(path, dpi=(dpi, dpi))
-    print(f"Saved print-ready patch: {path}  ({px}×{px} px @ {dpi} DPI)")
+    if img.size != (px, px):
+        # Only resize if somehow wrong size (shouldn't happen with --patch-size 945)
+        img = img.resize((px, px), resample=Image.LANCZOS)
+    img.save(path, dpi=(dpi, dpi))
+    print(f"Saved print-ready patch: {path}  ({img.size[0]}×{img.size[1]} px @ {dpi} DPI)")
 
 
 # ── evaluate ──────────────────────────────────────────────────────────────────
 
 def evaluate_patch(
-    model:        torch.nn.Module,
-    dataset:      torch.utils.data.Dataset,
-    patch_01:     torch.Tensor,
-    target_label: int,
-    patch_size:   int   = 80,
-    device:       torch.device = None,
-    batch_size:   int   = 64,
-    n_eot:        int   = 16,
+    model:           torch.nn.Module,
+    dataset:         torch.utils.data.Dataset,
+    patch_01:        torch.Tensor,
+    target_label:    int,
+    target_patch_px: int   = 32,
+    device:          torch.device = None,
+    batch_size:      int   = 64,
+    n_eot:           int   = 16,
 ):
     if device is None:
         device = get_device()
@@ -224,7 +268,8 @@ def evaluate_patch(
 
             eot_votes = torch.zeros(imgs.size(0), dtype=torch.long, device=device)
             for _ in range(n_eot):
-                patched     = apply_patch(imgs, patch_norm, randomise_placement=True)
+                patched     = apply_patch(imgs, patch_norm, randomise_placement=True,
+                                          target_patch_px=target_patch_px)
                 patched_01  = patched * std + mean
                 patched_01  = eot_batch(patched_01)
                 patched_eot = (patched_01 - mean) / std
@@ -263,7 +308,7 @@ def main(args):
     target_label = KMH_TO_LABEL[args.target]
     print(f"Target: {args.target} km/h  (label {target_label})")
 
-    patch_01 = optimise_patch(
+    patch_01, target_patch_px = optimise_patch(
         model        = model,
         dataset      = val_ds,
         target_label = target_label,
@@ -274,6 +319,7 @@ def main(args):
         batch_size   = args.batch,
         device       = device,
         universal    = args.universal,
+        print_cm     = args.print_cm,
     )
 
     torch.save(patch_01, args.out)
@@ -283,7 +329,7 @@ def main(args):
     save_patch_png(patch_01.cpu(), str(png_path), print_cm=args.print_cm)
 
     evaluate_patch(model, val_ds, patch_01, target_label,
-                   patch_size=args.patch_size, device=device, n_eot=args.eot_samples)
+                   target_patch_px=target_patch_px, device=device, n_eot=args.eot_samples)
 
 
 if __name__ == "__main__":
