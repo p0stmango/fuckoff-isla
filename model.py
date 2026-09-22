@@ -251,3 +251,58 @@ def load(path: str, arch: str = "resnet18") -> GTSRBSurrogate:
     state = torch.load(path, map_location="cpu", weights_only=True)
     model.load_state_dict(state)
     return model
+
+
+def load_ensemble(
+    r18_path:  str = "surrogate.pt",
+    r50_path:  str = "surrogate_resnet50.pt",
+    mbv3_path: str = "surrogate_mobilenet_v3_small.pt",
+) -> list:
+    """
+    Load R18 + R50 + MBV3 surrogates and return as [r18, r50, mbv3] (all on CPU).
+
+    Checkpoint names follow the patch_attack.py convention:
+      surrogate.pt                       ← first arch (resnet18), uses --model directly
+      surrogate_resnet50.pt              ← {stem}_{arch}{suffix}
+      surrogate_mobilenet_v3_small.pt    ← {stem}_{arch}{suffix}
+
+    Raises FileNotFoundError immediately if any checkpoint is missing — do not
+    degrade silently to a smaller ensemble, as that gives false confidence in
+    the loss signal and inflates transfer ASR.
+
+    Move to device in the caller:
+        models = load_ensemble(...)
+        models = [m.to(device) for m in models]
+        for m in models:
+            m._arch_name = ["resnet18", "resnet50", "mobilenet_v3_small"][models.index(m)]
+    """
+    import os
+    missing = [
+        label
+        for label, p in [("R18", r18_path), ("R50", r50_path), ("MBV3", mbv3_path)]
+        if not os.path.exists(p)
+    ]
+    if missing:
+        paths = dict(R18=r18_path, R50=r50_path, MBV3=mbv3_path)
+        detail = "  ".join(f"{k}='{paths[k]}'" for k in missing)
+        raise FileNotFoundError(
+            f"Ensemble incomplete — missing checkpoint(s): {detail}\n"
+            "Train missing surrogates before running ensemble optimisation:\n"
+            "  python train.py --arch resnet50 --out surrogate_resnet50.pt\n"
+            "  python train.py --arch mobilenet_v3_small --out surrogate_mobilenet_v3_small.pt"
+        )
+
+    print(f"Loading R18  surrogate : {r18_path}")
+    r18  = load(r18_path,  arch="resnet18")
+    r18._arch_name = "resnet18"
+
+    print(f"Loading R50  surrogate : {r50_path}")
+    r50  = load(r50_path,  arch="resnet50")
+    r50._arch_name = "resnet50"
+
+    print(f"Loading MBV3 surrogate : {mbv3_path}")
+    mbv3 = load(mbv3_path, arch="mobilenet_v3_small")
+    mbv3._arch_name = "mobilenet_v3_small"
+
+    print(f"Ensemble ready: 3 surrogates (R18 + R50 + MBV3), {NUM_CLASSES} AU classes")
+    return [r18, r50, mbv3]
