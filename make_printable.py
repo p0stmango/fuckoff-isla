@@ -115,12 +115,9 @@ def render_sign_on_plate(sign_diam_px: int, plate_w_px: int, plate_h_px: int,
     return img
 
 
-def make_circular_patch(patch_img: Image.Image, size_px: int) -> Image.Image:
-    patch = patch_img.convert("RGBA").resize((size_px, size_px), Image.LANCZOS)
-    mask  = Image.new("L", (size_px, size_px), 0)
-    ImageDraw.Draw(mask).ellipse([0, 0, size_px - 1, size_px - 1], fill=255)
-    patch.putalpha(mask)
-    return patch
+def make_rectangular_patch(patch_img: Image.Image, size_px: int) -> Image.Image:
+    """Resize patch to size_px × size_px, no masking — full rectangle."""
+    return patch_img.convert("RGB").resize((size_px, size_px), Image.LANCZOS)
 
 
 def make_printable(patch_path: str, out_path: str,
@@ -144,11 +141,11 @@ def make_printable(patch_path: str, out_path: str,
     scx = plate_x + PLATE_W_PX // 2
     scy = plate_y + PLATE_H_PX // 2
 
-    # Composite patch
-    patch_circ = make_circular_patch(Image.open(patch_path), PATCH_PX)
+    # Composite patch — rectangular, pasted directly
+    patch_rect = make_rectangular_patch(Image.open(patch_path), PATCH_PX)
     px_left = int(scx + patch_x_mm * MM_TO_PX) - PATCH_PX // 2
     py_top  = int(scy + patch_y_mm * MM_TO_PX) - PATCH_PX // 2
-    canvas.paste(patch_circ, (px_left, py_top), mask=patch_circ.split()[3])
+    canvas.paste(patch_rect, (px_left, py_top))
 
     # Footer
     draw = ImageDraw.Draw(canvas)
