@@ -11,17 +11,23 @@ Strategy:
   3. Optionally unfreeze the last block for a few more epochs
 
 Usage:
-    # ResNet-18 (default)
+    # ResNet-18 — load existing GTSRB pretrain cache
     python train.py
 
-    # ResNet-50
-    python train.py --arch resnet50 --out surrogate_resnet50.pt
+    # ResNet-50 — pretrain on GTSRB then fine-tune (~15 min one-time cost)
+    python train.py --arch resnet50 --pretrain-gtsrb --out surrogate_resnet50.pt
 
-    # MobileNetV3-Small (EyeQ4 proxy)
-    python train.py --arch mobilenet_v3_small --out surrogate_mobilenet_v3_small.pt
+    # MobileNetV3-Small — pretrain on GTSRB then fine-tune (~15 min)
+    python train.py --arch mobilenet_v3_small --pretrain-gtsrb \
+        --out surrogate_mobilenet_v3_small.pt
 
-    # Full fine-tune with custom epochs
-    python train.py --arch resnet18 --epochs 10 --unfreeze-epoch 5 --batch 64
+    # EfficientNet-B0
+    python train.py --arch efficientnet_b0 --pretrain-gtsrb \
+        --out surrogate_efficientnet_b0.pt
+
+    # Skip GTSRB pretrain (faster but lower accuracy)
+    python train.py --arch mobilenet_v3_small --epochs 20 --unfreeze-epoch 3 \
+        --out surrogate_mobilenet_v3_small.pt
 """
 import argparse
 
@@ -48,6 +54,13 @@ def train(args):
     device = get_device()
     print(f"Device: {device}")
 
+    # Derive a per-arch pretrain path so each arch gets its own GTSRB backbone.
+    # Avoids trying to load an R18 state dict into MBV3 (shape mismatch crash).
+    if args.pretrain_path is None:
+        pretrain_path = f"./gtsrb_backbone_{args.arch}.pt"
+    else:
+        pretrain_path = args.pretrain_path
+
     train_loader, val_loader = make_dataloaders(
         gtsrb_root=args.data,
         aus_root=args.aus_data,
@@ -60,7 +73,11 @@ def train(args):
     print(f"Train batches: {len(train_loader)}  Val batches: {len(val_loader)}")
     print(f"Classes ({NUM_CLASSES}): {ALL_SPEEDS}")
 
-    model = build_surrogate(arch=args.arch).to(device)
+    model = build_surrogate(
+        arch=args.arch,
+        pretrain=args.pretrain_gtsrb,
+        pretrain_path=pretrain_path,
+    ).to(device)
     model.freeze_backbone()
 
     # Only the remapping head is trained initially
@@ -132,6 +149,12 @@ def train(args):
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--arch",           default="resnet18", choices=ARCH_CHOICES)
+    p.add_argument("--pretrain-gtsrb", action="store_true", default=False,
+                   help="Run GTSRB pretrain before AU fine-tune (~15 min one-time cost). "
+                        "Strongly recommended for non-ResNet archs.")
+    p.add_argument("--pretrain-path",  default=None,
+                   help="Path to GTSRB backbone cache. "
+                        "Default: gtsrb_backbone_{arch}.pt (per-arch, avoids shape mismatches)")
     p.add_argument("--epochs",         type=int,   default=8)
     p.add_argument("--unfreeze-epoch", type=int,   default=5,
                    help="Epoch at which to unfreeze the last backbone block")
