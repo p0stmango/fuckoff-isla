@@ -1,0 +1,131 @@
+"""
+Fine-tune the pretrained GTSRB surrogate on Australian synthetic data.
+
+This is OPTIONAL — the pretrained backbone already handles the GTSRB speed
+classes well.  Fine-tuning is only needed to teach the model AU-only classes
+(5, 10, 15, 25, 40, 90, 110 km/h) that GTSRB never saw.
+
+Strategy:
+  1. Load pretrained GTSRB backbone (frozen)
+  2. Train only the remapping head for a few epochs on AU synth data
+  3. Optionally unfreeze the last ResNet block for a few more epochs
+
+Usage:
+    # Minimal — head-only, AU synth data generated automatically
+    python train.py
+
+    # Full fine-tune
+    python train.py --epochs 10 --unfreeze-epoch 5 --batch 64
+
+    # Use a different HF model
+    python train.py --model-id adhisetiawan/resnet50-gtsrb --arch resnet50
+"""
+import argparse
+
+import torch
+import torch.nn as nn
+from tqdm import tqdm
+
+from dataset import make_dataloaders, ALL_SPEEDS, NUM_CLASSES
+from model import build_surrogate, get_device, save
+
+
+def train(args):
+    device = get_device()
+    print(f"Device: {device}")
+
+    train_loader, val_loader = make_dataloaders(
+        gtsrb_root=args.data,
+        aus_root=args.aus_data,
+        batch_size=args.batch,
+        num_workers=args.workers,
+        download=True,
+        auto_generate=True,
+        n_aus_per_cls=args.n_aus,
+    )
+    print(f"Train batches: {len(train_loader)}  Val batches: {len(val_loader)}")
+    print(f"Classes ({NUM_CLASSES}): {ALL_SPEEDS}")
+
+    model = build_surrogate(model_id=args.model_id, arch=args.arch).to(device)
+    model.freeze_backbone()
+
+    # Only the remapping head is trained initially
+    optimizer = torch.optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=args.lr, weight_decay=1e-4,
+    )
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+
+    best_acc = 0.0
+
+    for epoch in range(1, args.epochs + 1):
+        if epoch == args.unfreeze_epoch:
+            print(f"Epoch {epoch}: unfreezing backbone last block")
+            # Unfreeze only layer4 (last residual block) — keeps earlier features stable
+            for name, p in model.backbone.named_parameters():
+                if "layer4" in name or "fc" in name:
+                    p.requires_grad = True
+            optimizer.add_param_group({
+                "params": [p for n, p in model.backbone.named_parameters()
+                           if ("layer4" in n or "fc" in n) and p.requires_grad],
+                "lr": args.lr * 0.05,
+            })
+
+        # ── train ──
+        model.train()
+        running_loss = correct = total = 0
+        for imgs, labels in tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs} train", leave=False):
+            imgs, labels = imgs.to(device), labels.to(device)
+            optimizer.zero_grad()
+            logits = model(imgs)
+            loss   = criterion(logits, labels)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item() * imgs.size(0)
+            correct      += (logits.argmax(1) == labels).sum().item()
+            total        += imgs.size(0)
+        train_acc = correct / total
+
+        # ── validate ──
+        model.eval()
+        v_correct = v_total = 0
+        with torch.no_grad():
+            for imgs, labels in tqdm(val_loader, desc=f"Epoch {epoch}/{args.epochs} val  ", leave=False):
+                imgs, labels = imgs.to(device), labels.to(device)
+                v_correct += (model(imgs).argmax(1) == labels).sum().item()
+                v_total   += imgs.size(0)
+        val_acc = v_correct / v_total
+
+        scheduler.step()
+
+        print(
+            f"Epoch {epoch:3d}  loss={running_loss/total:.4f}  "
+            f"train={train_acc:.3f}  val={val_acc:.3f}"
+        )
+
+        if val_acc > best_acc:
+            best_acc = val_acc
+            save(model, args.out)
+            print(f"  ↳ saved ({val_acc:.3f}) → {args.out}")
+
+    print(f"\nFine-tune complete. Best val accuracy: {best_acc:.3f}")
+    print("If val_acc is low on AU-only classes, increase --n-aus or --epochs.")
+
+
+if __name__ == "__main__":
+    p = argparse.ArgumentParser()
+    p.add_argument("--model-id",      default="Javtor/resnet18-GTSRB",
+                   help="HuggingFace model ID for pretrained GTSRB backbone")
+    p.add_argument("--arch",          default="resnet18", choices=["resnet18", "resnet50"])
+    p.add_argument("--epochs",        type=int,   default=8)
+    p.add_argument("--unfreeze-epoch",type=int,   default=5,
+                   help="Epoch at which to unfreeze ResNet layer4 for fine-tuning")
+    p.add_argument("--batch",         type=int,   default=64)
+    p.add_argument("--lr",            type=float, default=3e-3)
+    p.add_argument("--data",          type=str,   default="./data")
+    p.add_argument("--aus-data",      type=str,   default="./data/aus_synth")
+    p.add_argument("--workers",       type=int,   default=4)
+    p.add_argument("--n-aus",         type=int,   default=400)
+    p.add_argument("--out",           type=str,   default="surrogate.pt")
+    train(p.parse_args())
