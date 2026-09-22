@@ -231,34 +231,40 @@ def test_surrogate(canvas: Image.Image, patch_path: str,
     print(f"Patch footprint in model input: {target_patch_px}px  "
           f"(REAL_PATCH_MM={REAL_PATCH_MM}, SIGN_DIAM_MM={SIGN_DIAM_MM})")
 
-    # Crop the sign region from the canvas and prepare a sign tensor for apply_patch()
-    # — sign is centred on canvas, crop to SIGN_PX with a small margin
-    cw, ch = canvas.size
-    cx, cy = cw // 2, ch // 2
+    # Render a CLEAN sign (no patch) so apply_patch() starts from a blank slate.
+    # If we crop from canvas, the patch is already baked in at a fixed position
+    # and apply_patch() would double-stamp it — randomise_placement would do nothing.
+    clean_plate = render_sign_on_plate(SIGN_PX, PLATE_W_PX, PLATE_H_PX, PLATE_R_PX)
+    clean_canvas = Image.new("RGB", (PLATE_W_PX, PLATE_H_PX), (255, 255, 255))
+    clean_canvas.paste(clean_plate, (0, 0), mask=clean_plate.split()[3])
+
+    # Crop with same margin as round_trip_test / eval_patch
     margin = int(SIGN_PX * 0.12)
     half   = SIGN_PX // 2 + margin
-    crop   = canvas.crop((cx - half, cy - half, cx + half, cy + half))
+    cx, cy = PLATE_W_PX // 2, PLATE_H_PX // 2
+    clean_crop = clean_canvas.crop((cx - half, cy - half, cx + half, cy + half))
+    clean_crop.save("test_crop.png")
 
-    # Use val_transforms so the sign tensor matches training distribution
-    sign_tensor = val_transforms(crop.convert("RGB")).unsqueeze(0).to(device)
+    # val_transforms: resize to 224×224, ToTensor, Normalize
+    sign_tensor = val_transforms(clean_crop.convert("RGB")).unsqueeze(0).to(device)
 
     target_pred = KMH_TO_LABEL[80]
     preds_per_model = {name: [] for name in models}
 
     with torch.no_grad():
         for _ in range(n_runs):
-            # apply_patch positions the patch at correct scale (75px in 224px input)
-            patched    = apply_patch(sign_tensor, patch_norm,
-                                     randomise_placement=True,
-                                     target_patch_px=target_patch_px)
-            patched_01 = patched * std + mean
-            patched_01 = eot_batch(patched_01.clone())
+            # Each run: place patch at a random position on the clean sign, then EOT
+            patched     = apply_patch(sign_tensor, patch_norm,
+                                      randomise_placement=True,
+                                      target_patch_px=target_patch_px)
+            patched_01  = patched * std + mean
+            patched_01  = eot_batch(patched_01.clone())
             patched_eot = (patched_01 - mean) / std
 
             for name, m in models.items():
                 preds_per_model[name].append(m(patched_eot).argmax(1).item())
 
-    print(f"\n── Surrogate predictions on printable ({n_runs} EOT runs) ──")
+    print(f"\n── Surrogate predictions (random placement + EOT, {n_runs} runs) ──")
     print(f"  {'Model':<25}  {'Top pred':>9}  {'Conf':>6}  {'ASR@80':>7}")
     print("  " + "─" * 54)
     worst_asr = 1.0
@@ -271,10 +277,7 @@ def test_surrogate(canvas: Image.Image, patch_path: str,
         worst_asr = min(worst_asr, asr80)
         print(f"  {name:<25}  {ALL_SPEEDS[best]:>5} km/h  {conf:>5.1%}  {asr80:>6.1%}{hit}")
     print(f"  {'Ensemble worst-case ASR@80':<25}  {'':>9}  {'':>6}  {worst_asr:>6.1%}")
-
-    # Save cropped sign for visual inspection
-    crop.save("test_crop.png")
-    print(f"\nCropped sign saved to test_crop.png — check patch is visible and well-positioned")
+    print(f"\ntest_crop.png shows the clean sign the patch is applied onto each run.")
 
 
 if __name__ == "__main__":
