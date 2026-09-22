@@ -356,12 +356,17 @@ def apply_clahe(x: torch.Tensor) -> torch.Tensor:
     import cv2
     import numpy as np
 
-    x_det  = x.detach()                                        # same values, no grad
-    arr    = (x_det.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-    clahe  = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
-    out    = clahe.apply(arr[:, :, 0])                         # single grayscale channel
-    out3   = np.stack([out] * 3, axis=2).astype(np.float32) / 255.0
-    result = torch.from_numpy(out3).permute(2, 0, 1).unsqueeze(0).to(x.device)
+    x_det = x.detach()                                         # same values, no grad
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
+
+    results = []
+    for i in range(x_det.shape[0]):                            # iterate over batch
+        arr  = (x_det[i].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+        out  = clahe.apply(arr[:, :, 0])                       # single grayscale channel
+        out3 = np.stack([out] * 3, axis=2).astype(np.float32) / 255.0
+        results.append(torch.from_numpy(out3).permute(2, 0, 1))
+
+    result = torch.stack(results, dim=0).to(x.device)
 
     # Straight-through: forward = result, backward gradient passes through x unchanged.
     # x - x_det == 0 in the forward pass, but carries x's gradient in the backward pass.
