@@ -251,11 +251,18 @@ def test_surrogate(canvas: Image.Image, patch_path: str,
     target_pred = KMH_TO_LABEL[80]
     preds_per_model = {name: [] for name in models}
 
+    import random as _random
+    # Placement range must match what patch_attack.py trained on:
+    # off-centre right (+60mm target) with ±25mm human placement error.
+    _CX_MIN, _CX_MAX = 0.62, 0.84
+    _CY_MIN, _CY_MAX = 0.35, 0.58
     with torch.no_grad():
         for _ in range(n_runs):
-            # Each run: place patch at a random position on the clean sign, then EOT
+            cx = _random.uniform(_CX_MIN, _CX_MAX)
+            cy = _random.uniform(_CY_MIN, _CY_MAX)
             patched     = apply_patch(sign_tensor, patch_norm,
-                                      randomise_placement=True,
+                                      cx_frac=cx, cy_frac=cy,
+                                      randomise_placement=False,
                                       target_patch_px=target_patch_px)
             patched_01  = patched * std + mean
             patched_01  = eot_batch(patched_01.clone())
