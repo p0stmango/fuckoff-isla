@@ -170,6 +170,10 @@ def optimise_patch(
     real_sign_mm: float = 450.0,
     nps_weight:   float = 0.01,
     tv_weight:    float = 0.05,
+    cx_min:       float = 0.62,
+    cx_max:       float = 0.84,
+    cy_min:       float = 0.35,
+    cy_max:       float = 0.58,
 ) -> torch.Tensor:
     """
     patch_size is the PRINT resolution of the patch (e.g. 945 = 8cm @ 300 DPI).
@@ -242,7 +246,13 @@ def optimise_patch(
             # Sample one surrogate per EOT step — prevents the patch from
             # exploiting any single model's blind spots.
             surrogate = random.choice(models)
-            patched     = apply_patch(imgs, patch_norm, randomise_placement=True,
+            # Sample placement from the off-centre region where the patch
+            # will actually be mounted — avoids overlaying the sign numeral
+            # and trains across the full range of physical placement error.
+            cx = random.uniform(cx_min, cx_max)
+            cy = random.uniform(cy_min, cy_max)
+            patched     = apply_patch(imgs, patch_norm, cx_frac=cx, cy_frac=cy,
+                                      randomise_placement=False,
                                       target_patch_px=target_patch_px)
             patched_01  = patched * std + mean
             patched_01  = eot_batch(patched_01.clone())
@@ -273,7 +283,11 @@ def optimise_patch(
         if step % 50 == 0:
             with torch.no_grad():
                 patch_norm_det  = to_normalised(patch_01.detach().clamp(0, 1))
-                patched_log     = apply_patch(imgs, patch_norm_det, randomise_placement=True,
+                cx_log = random.uniform(cx_min, cx_max)
+                cy_log = random.uniform(cy_min, cy_max)
+                patched_log     = apply_patch(imgs, patch_norm_det,
+                                              cx_frac=cx_log, cy_frac=cy_log,
+                                              randomise_placement=False,
                                               target_patch_px=target_patch_px)
                 patched_01_log  = patched_log * std + mean
                 patched_01_log  = eot_batch(patched_01_log)
@@ -317,6 +331,10 @@ def evaluate_patch(
     device:          torch.device = None,
     batch_size:      int   = 64,
     n_eot:           int   = 16,
+    cx_min:          float = 0.62,
+    cx_max:          float = 0.84,
+    cy_min:          float = 0.35,
+    cy_max:          float = 0.58,
 ):
     """
     Evaluate ASR independently on each surrogate so you can see per-arch
@@ -351,7 +369,10 @@ def evaluate_patch(
 
                 eot_votes = torch.zeros(B, dtype=torch.long, device=device)
                 for _ in range(n_eot):
-                    patched     = apply_patch(imgs, patch_norm, randomise_placement=True,
+                    cx = random.uniform(cx_min, cx_max)
+                    cy = random.uniform(cy_min, cy_max)
+                    patched     = apply_patch(imgs, patch_norm, cx_frac=cx, cy_frac=cy,
+                                              randomise_placement=False,
                                               target_patch_px=target_patch_px)
                     patched_01  = patched * std + mean
                     patched_01  = eot_batch(patched_01)
@@ -429,6 +450,10 @@ def main(args):
         print_cm     = args.print_cm,
         nps_weight   = args.nps_weight,
         tv_weight    = args.tv_weight,
+        cx_min       = args.cx_min,
+        cx_max       = args.cx_max,
+        cy_min       = args.cy_min,
+        cy_max       = args.cy_max,
     )
 
     torch.save(patch_01, args.out)
@@ -438,7 +463,9 @@ def main(args):
     save_patch_png(patch_01.cpu(), str(png_path), print_cm=args.print_cm)
 
     evaluate_patch(ensemble, val_ds, patch_01, target_label,
-                   target_patch_px=target_patch_px, device=device, n_eot=args.eot_samples)
+                   target_patch_px=target_patch_px, device=device, n_eot=args.eot_samples,
+                   cx_min=args.cx_min, cx_max=args.cx_max,
+                   cy_min=args.cy_min, cy_max=args.cy_max)
 
 
 if __name__ == "__main__":
@@ -461,4 +488,16 @@ if __name__ == "__main__":
     p.add_argument("--print-cm",      type=float, default=8.0,  help="Printed patch size in cm")
     p.add_argument("--nps-weight",    type=float, default=0.01, help="Printability loss weight (0 to disable)")
     p.add_argument("--tv-weight",     type=float, default=0.05, help="Total variation loss weight (0 to disable)")
+    # Placement range — train only over the off-centre region where the patch
+    # will physically appear.  Defaults cover +60mm right / ±10mm vertical
+    # with ±25mm human placement error.  cx/cy are fractions of image width/height
+    # (0.5 = sign centre; 0.75 ≈ +60mm right on a 190mm sign at 224px input).
+    p.add_argument("--cx-min",        type=float, default=0.62,
+                   help="Min patch centre X fraction (0=left edge, 0.5=sign centre)")
+    p.add_argument("--cx-max",        type=float, default=0.84,
+                   help="Max patch centre X fraction")
+    p.add_argument("--cy-min",        type=float, default=0.35,
+                   help="Min patch centre Y fraction (0=top, 0.5=sign centre)")
+    p.add_argument("--cy-max",        type=float, default=0.58,
+                   help="Max patch centre Y fraction")
     main(p.parse_args())
