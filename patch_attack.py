@@ -35,7 +35,7 @@ from dataset import (
     KMH_TO_LABEL, ALL_SPEEDS, IMG_SIZE, NUM_CLASSES,
 )
 from model import build_surrogate, get_device, load as load_model, ARCH_CHOICES
-from eot import eot_batch
+from eot import eot_batch, install_fake_quant_hooks
 
 # ── denormalise helper ───────────────────────────────────────────────────────
 _MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
@@ -427,6 +427,16 @@ def main(args):
 
     print(f"Ensemble: {[m._arch_name for m in ensemble]}")
 
+    if not args.no_fake_quant:
+        bits_choices = tuple(int(b) for b in args.fake_quant_bits.split(","))
+        print(f"Fake-quant EOT : bits={bits_choices}  p={args.fake_quant_p}  "
+              f"(per-layer, per-forward — hooks stay live through eval too)")
+        for m in ensemble:
+            handles = install_fake_quant_hooks(
+                m, bits_choices=bits_choices, p_apply=args.fake_quant_p,
+            )
+            print(f"  {m._arch_name}: hooked {len(handles)} Conv2d/Linear layers")
+
     from torch.utils.data import ConcatDataset
     gtsrb_val = FilteredGTSRB(args.data, split="test", transform=val_transforms, download=False)
     aus_val   = AUSynthDataset(args.aus_data, transform=val_transforms, split="val", auto_generate=False)
@@ -488,6 +498,15 @@ if __name__ == "__main__":
     p.add_argument("--print-cm",      type=float, default=8.0,  help="Printed patch size in cm")
     p.add_argument("--nps-weight",    type=float, default=0.01, help="Printability loss weight (0 to disable)")
     p.add_argument("--tv-weight",     type=float, default=0.05, help="Total variation loss weight (0 to disable)")
+    # Model-side quantisation EOT — hooks each surrogate's Conv2d/Linear layers
+    # so the optimiser sees int-N activation rounding, approximating an
+    # embedded NPU without needing the real target's weights/calibration.
+    p.add_argument("--no-fake-quant", action="store_true", default=False,
+                   help="Disable fake-quant activation hooks (enabled by default)")
+    p.add_argument("--fake-quant-bits", default="4,6,8",
+                   help="Comma-separated bit-widths to sample per layer per forward")
+    p.add_argument("--fake-quant-p",  type=float, default=0.5,
+                   help="Probability a given layer is fake-quantised on a given forward")
     # Placement range — train only over the off-centre region where the patch
     # will physically appear.  Defaults cover +60mm right / ±10mm vertical
     # with ±25mm human placement error.  cx/cy are fractions of image width/height

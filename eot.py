@@ -9,6 +9,8 @@ Transforms are grouped and applied in physical order:
   4. LIGHTING — ambient + point-source illumination variation
   5. CAMERA  — sensor noise, motion blur, compression artifacts
   6. SENSOR  — grayscale conversion + CLAHE (Mobileye S-Cam4 pipeline)
+  7. QUANT   — model-side: fake-quantised activations in the surrogate itself
+               (hook-based, not part of eot_batch — see install_fake_quant_hooks)
 
 All ops are differentiable so gradients flow back into the patch.
 """
@@ -16,6 +18,7 @@ import math
 import random
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 
@@ -371,6 +374,63 @@ def apply_clahe(x: torch.Tensor) -> torch.Tensor:
     # Straight-through: forward = result, backward gradient passes through x unchanged.
     # x - x_det == 0 in the forward pass, but carries x's gradient in the backward pass.
     return result + (x - x_det)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# GROUP 7 — MODEL-SIDE QUANTISATION NOISE
+# ════════════════════════════════════════════════════════════════════════════
+# Unlike groups 1-6, this doesn't touch the input image — it hooks the
+# surrogate's own Conv2d/Linear layers so the optimiser sees int-N rounding
+# in the *activations*, approximating an embedded NPU without needing the
+# real target's weights or calibration stats. Bit-width, and whether a given
+# layer is quantised on a given forward pass, are both sampled — quantisation
+# scheme is treated as an unknown nuisance to marginalise over, same as the
+# unknown printer ICC profile in group 1.
+
+def _fake_quant_hook(bits_choices, p_apply):
+    def hook(module, inp, out):
+        if random.random() > p_apply:
+            return out
+        bits    = random.choice(bits_choices)
+        qmax    = float(2 ** bits - 1)
+        out_det = out.detach()
+        lo, hi  = out_det.min(), out_det.max()
+        scale   = (hi - lo) / qmax + 1e-8
+        q       = torch.round((out_det - lo) / scale).clamp(0, qmax)
+        dq      = q * scale + lo
+        # Straight-through: forward = dq, backward = identity w.r.t. out.
+        return out + (dq - out_det)
+    return hook
+
+
+def install_fake_quant_hooks(model: nn.Module,
+                             bits_choices=(4, 6, 8),
+                             p_apply: float = 0.5) -> list:
+    """
+    Register forward hooks on every Conv2d/Linear in `model` that fake-quantise
+    that layer's output to a randomly sampled bit-width from bits_choices,
+    applied with probability p_apply per layer per forward call.
+
+    Straight-through estimator keeps gradients flowing to the patch. Returns
+    the hook handles — pass to remove_fake_quant_hooks() to undo.
+
+    This is deliberately loose about matching any specific target's exact
+    quantisation scheme (per-tensor vs per-channel, symmetric vs asymmetric,
+    which layers get quantised) — none of that is knowable from outside the
+    hardware. Instead it samples across a spread of plausible configs so the
+    patch is optimised to survive quantisation noise in general rather than
+    overfitting to one guessed scheme.
+    """
+    handles = []
+    for m in model.modules():
+        if isinstance(m, (nn.Conv2d, nn.Linear)):
+            handles.append(m.register_forward_hook(_fake_quant_hook(bits_choices, p_apply)))
+    return handles
+
+
+def remove_fake_quant_hooks(handles: list) -> None:
+    for h in handles:
+        h.remove()
 
 
 # ════════════════════════════════════════════════════════════════════════════
