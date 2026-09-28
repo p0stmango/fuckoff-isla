@@ -35,7 +35,7 @@ from dataset import (
     KMH_TO_LABEL, ALL_SPEEDS, IMG_SIZE, NUM_CLASSES,
 )
 from model import build_surrogate, get_device, load as load_model, ARCH_CHOICES
-from eot import eot_batch, install_fake_quant_hooks
+from eot import eot_batch, install_fake_quant_hooks, FakeQuantSchedule
 
 # ── denormalise helper ───────────────────────────────────────────────────────
 _MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
@@ -174,6 +174,8 @@ def optimise_patch(
     cx_max:       float = 0.84,
     cy_min:       float = 0.35,
     cy_max:       float = 0.58,
+    fake_quant_schedule = None,   # FakeQuantSchedule | None — flipped on after warmup
+    fake_quant_warmup: int = 200,
 ) -> torch.Tensor:
     """
     patch_size is the PRINT resolution of the patch (e.g. 945 = 8cm @ 300 DPI).
@@ -227,6 +229,11 @@ def optimise_patch(
 
     pbar = tqdm(range(1, steps + 1), desc="Optimising patch")
     for step in pbar:
+        if (fake_quant_schedule is not None and not fake_quant_schedule.enabled
+                and step >= fake_quant_warmup):
+            fake_quant_schedule.enabled = True
+            pbar.write(f"[step {step}] fake-quant hooks enabled (warmup complete)")
+
         try:
             imgs, _ = next(data_iter)
         except StopIteration:
@@ -274,6 +281,7 @@ def optimise_patch(
 
         optimizer.zero_grad()
         total_loss.backward()
+        torch.nn.utils.clip_grad_norm_([patch_01], max_norm=10.0)
         optimizer.step()
         scheduler.step()
 
@@ -427,13 +435,17 @@ def main(args):
 
     print(f"Ensemble: {[m._arch_name for m in ensemble]}")
 
+    fake_quant_schedule = None
     if not args.no_fake_quant:
         bits_choices = tuple(int(b) for b in args.fake_quant_bits.split(","))
+        fake_quant_schedule = FakeQuantSchedule(enabled=False)  # off until warmup elapses
         print(f"Fake-quant EOT : bits={bits_choices}  p={args.fake_quant_p}  "
+              f"warmup={args.fake_quant_warmup} steps  "
               f"(per-layer, per-forward — hooks stay live through eval too)")
         for m in ensemble:
-            handles = install_fake_quant_hooks(
+            handles, _ = install_fake_quant_hooks(
                 m, bits_choices=bits_choices, p_apply=args.fake_quant_p,
+                schedule=fake_quant_schedule,
             )
             print(f"  {m._arch_name}: hooked {len(handles)} Conv2d/Linear layers")
 
@@ -464,6 +476,8 @@ def main(args):
         cx_max       = args.cx_max,
         cy_min       = args.cy_min,
         cy_max       = args.cy_max,
+        fake_quant_schedule = fake_quant_schedule,
+        fake_quant_warmup   = args.fake_quant_warmup,
     )
 
     torch.save(patch_01, args.out)
@@ -503,10 +517,12 @@ if __name__ == "__main__":
     # embedded NPU without needing the real target's weights/calibration.
     p.add_argument("--no-fake-quant", action="store_true", default=False,
                    help="Disable fake-quant activation hooks (enabled by default)")
-    p.add_argument("--fake-quant-bits", default="4,6,8",
+    p.add_argument("--fake-quant-bits", default="6,8",
                    help="Comma-separated bit-widths to sample per layer per forward")
-    p.add_argument("--fake-quant-p",  type=float, default=0.5,
+    p.add_argument("--fake-quant-p",  type=float, default=0.3,
                    help="Probability a given layer is fake-quantised on a given forward")
+    p.add_argument("--fake-quant-warmup", type=int, default=200,
+                   help="Steps of clean (unquantised) optimisation before enabling the hooks")
     # Placement range — train only over the off-centre region where the patch
     # will physically appear.  Defaults cover +60mm right / ±10mm vertical
     # with ±25mm human placement error.  cx/cy are fractions of image width/height

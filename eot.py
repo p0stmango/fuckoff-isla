@@ -387,16 +387,38 @@ def apply_clahe(x: torch.Tensor) -> torch.Tensor:
 # scheme is treated as an unknown nuisance to marginalise over, same as the
 # unknown printer ICC profile in group 1.
 
-def _fake_quant_hook(bits_choices, p_apply):
+class FakeQuantSchedule:
+    """
+    Mutable on/off switch shared by every installed fake-quant hook, so the
+    training loop can warm up with clean activations and only enable
+    quantisation noise once the patch has found a stable regime — without
+    having to re-register hooks.
+    """
+    def __init__(self, enabled: bool = True):
+        self.enabled = enabled
+
+
+def _fake_quant_hook(bits_choices, p_apply, schedule):
     def hook(module, inp, out):
-        if random.random() > p_apply:
+        if not schedule.enabled or random.random() > p_apply:
             return out
         bits    = random.choice(bits_choices)
         qmax    = float(2 ** bits - 1)
         out_det = out.detach()
-        lo, hi  = out_det.min(), out_det.max()
+
+        # Percentile clip on a random subsample instead of raw min/max — a
+        # single outlier activation (easy to get from grayscale+CLAHE inputs)
+        # would otherwise set the step size for the whole tensor and wreck
+        # every other value in it.
+        flat = out_det.reshape(-1).float()
+        if flat.numel() > 4096:
+            flat = flat[torch.randint(0, flat.numel(), (4096,), device=flat.device)]
+        lo = torch.quantile(flat, 0.01)
+        hi = torch.quantile(flat, 0.99)
+
         scale   = (hi - lo) / qmax + 1e-8
-        q       = torch.round((out_det - lo) / scale).clamp(0, qmax)
+        clipped = out_det.clamp(lo, hi)
+        q       = torch.round((clipped - lo) / scale).clamp(0, qmax)
         dq      = q * scale + lo
         # Straight-through: forward = dq, backward = identity w.r.t. out.
         return out + (dq - out_det)
@@ -404,15 +426,18 @@ def _fake_quant_hook(bits_choices, p_apply):
 
 
 def install_fake_quant_hooks(model: nn.Module,
-                             bits_choices=(4, 6, 8),
-                             p_apply: float = 0.5) -> list:
+                             bits_choices=(6, 8),
+                             p_apply: float = 0.3,
+                             schedule: "FakeQuantSchedule | None" = None):
     """
     Register forward hooks on every Conv2d/Linear in `model` that fake-quantise
     that layer's output to a randomly sampled bit-width from bits_choices,
-    applied with probability p_apply per layer per forward call.
+    applied with probability p_apply per layer per forward call, and only while
+    schedule.enabled is True.
 
     Straight-through estimator keeps gradients flowing to the patch. Returns
-    the hook handles — pass to remove_fake_quant_hooks() to undo.
+    (handles, schedule) — pass handles to remove_fake_quant_hooks() to undo.
+    If no schedule is given a fresh always-enabled one is created.
 
     This is deliberately loose about matching any specific target's exact
     quantisation scheme (per-tensor vs per-channel, symmetric vs asymmetric,
@@ -421,11 +446,13 @@ def install_fake_quant_hooks(model: nn.Module,
     patch is optimised to survive quantisation noise in general rather than
     overfitting to one guessed scheme.
     """
+    if schedule is None:
+        schedule = FakeQuantSchedule(enabled=True)
     handles = []
     for m in model.modules():
         if isinstance(m, (nn.Conv2d, nn.Linear)):
-            handles.append(m.register_forward_hook(_fake_quant_hook(bits_choices, p_apply)))
-    return handles
+            handles.append(m.register_forward_hook(_fake_quant_hook(bits_choices, p_apply, schedule)))
+    return handles, schedule
 
 
 def remove_fake_quant_hooks(handles: list) -> None:
