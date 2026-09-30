@@ -391,7 +391,7 @@ def apply_sensor_noise(x: torch.Tensor) -> torch.Tensor:
 
 def apply_scale_jitter(x: torch.Tensor) -> torch.Tensor:
     B, C, H, W = x.shape
-    scale = _rand(0.80, 1.15)
+    scale = _rand(0.40, 1.20)
     if abs(scale - 1.0) < 0.03:
         return x
     new_h = max(16, int(H * scale))
