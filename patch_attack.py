@@ -37,6 +37,58 @@ from dataset import (
 from model import build_surrogate, get_device, load as load_model, ARCH_CHOICES
 from eot import eot_batch, eot_print, eot_scene, install_fake_quant_hooks, FakeQuantSchedule
 
+
+# ── INT8 PTQ for eval models ────────────────────────────────────────────────
+
+def _build_quantized_eval_model(fp_model: torch.nn.Module,
+                                 calibration_loader,
+                                 device: torch.device,
+                                 n_batches: int = 150) -> torch.nn.Module:
+    """
+    Post-training static quantisation of a surrogate to true INT8.
+    Used only for eval (no gradient flow) — gives ground-truth measurement
+    of whether the patch survives real quantisation.
+
+    Returns a CPU-only quantized model (PyTorch eager-mode quantization
+    doesn't support CUDA).
+    """
+    import copy
+    import torch.ao.quantization as tq
+
+    model_fp = copy.deepcopy(fp_model).cpu().eval()
+
+    # Fuse Conv-BN-ReLU and Linear-ReLU blocks where possible
+    # (this is what real inference engines do before quantising)
+    try:
+        model_fp = torch.ao.quantization.fuse_modules_qat(model_fp, [], inplace=False)
+    except Exception:
+        pass  # not all architectures have easily fuseable patterns — fine
+
+    # Set up per-tensor symmetric INT8 (matches EyeQ4 assumption)
+    model_fp.qconfig = tq.QConfig(
+        activation=tq.observer.MinMaxObserver.with_args(
+            dtype=torch.qint8, qscheme=torch.per_tensor_symmetric),
+        weight=tq.observer.MinMaxObserver.with_args(
+            dtype=torch.qint8, qscheme=torch.per_tensor_symmetric),
+    )
+    tq.prepare(model_fp, inplace=True)
+
+    # Calibrate — run real data through to collect activation ranges
+    with torch.no_grad():
+        for i, (imgs, _) in enumerate(calibration_loader):
+            if i >= n_batches:
+                break
+            model_fp(imgs.cpu())
+
+    # Convert observers → actual quantised ops
+    tq.convert(model_fp, inplace=True)
+
+    arch_name = getattr(fp_model, '_arch_name', 'unknown')
+    model_fp._arch_name = f"{arch_name}_int8"
+    print(f"  PTQ INT8 ready: {model_fp._arch_name} (calibrated on {min(i+1, n_batches)} batches)")
+    return model_fp
+
+
 # ── denormalise helper ───────────────────────────────────────────────────────
 _MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
 _STD  = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
@@ -221,6 +273,7 @@ def optimise_patch(
     oblique_eot:  bool  = False,
     init_patch:   str   = None,   # path to a saved patch tensor to resume from
     ensemble_weights: list = None, # per-model sampling weights (default: uniform)
+    quant_eval_models: list = None, # PTQ INT8 models for eval ASR measurement
 ) -> torch.Tensor:
     """
     patch_size is the PRINT resolution of the patch (e.g. 945 = 8cm @ 300 DPI).
@@ -398,9 +451,20 @@ def optimise_patch(
                     for m in models
                 )
 
+                # Also measure on true INT8 quantised models if available
+                quant_asr_str = ""
+                if quant_eval_models:
+                    patched_cpu = patched_eot_log.cpu()
+                    quant_asr = min(
+                        (qm(patched_cpu).argmax(1) == target_label).float().mean().item()
+                        for qm in quant_eval_models
+                    )
+                    quant_asr_str = f"  qASR={quant_asr:.2%}"
+
             if _fq_was_enabled:
                 fake_quant_schedule.enabled = True
-            pbar.set_postfix(loss=f"{total_loss.item():.4f}", ASR=f"{asr:.2%}")
+            pbar.set_postfix(loss=f"{total_loss.item():.4f}",
+                             ASR=f"{asr:.2%}{quant_asr_str}")
 
             arr = patch_01.detach().clamp(0, 1).squeeze(0).permute(1, 2, 0).cpu().numpy()
             Image.fromarray((arr * 255).astype(np.uint8)).save(f"patch_step_{step:04d}.png")
@@ -565,6 +629,25 @@ def main(args):
     target_label = KMH_TO_LABEL[args.target]
     print(f"Target: {args.target} km/h  (label {target_label})")
 
+    # ── Build true INT8 quantised copies for eval ──────────────────────────
+    quant_eval_models = None
+    if not args.no_quant_eval:
+        print("\nBuilding PTQ INT8 eval models (calibrating)...")
+        cal_loader = torch.utils.data.DataLoader(
+            val_ds, batch_size=64, shuffle=True, num_workers=0,
+        )
+        quant_eval_models = []
+        for m in ensemble:
+            try:
+                qm = _build_quantized_eval_model(m, cal_loader, device)
+                quant_eval_models.append(qm)
+            except Exception as e:
+                print(f"  WARNING: PTQ failed for {m._arch_name}: {e} — skipping")
+        if not quant_eval_models:
+            print("  No models survived PTQ — falling back to float eval")
+            quant_eval_models = None
+        print()
+
     patch_01, target_patch_px = optimise_patch(
         models       = ensemble,
         dataset      = val_ds,
@@ -591,6 +674,7 @@ def main(args):
         init_patch          = args.init_patch,
         ensemble_weights    = [float(w) for w in args.ensemble_weights.split(",")]
                               if args.ensemble_weights else None,
+        quant_eval_models   = quant_eval_models,
     )
 
     torch.save(patch_01, args.out)
@@ -599,11 +683,25 @@ def main(args):
     png_path = Path(args.out).with_suffix(".png")
     save_patch_png(patch_01.cpu(), str(png_path), print_cm=args.print_cm)
 
+    # Final eval on float surrogates (fake-quant disabled for clean measurement)
+    if fake_quant_schedule is not None:
+        fake_quant_schedule.enabled = False
+    print("\n── Float32 surrogate eval ──")
     evaluate_patch(ensemble, val_ds, patch_01, target_label,
                    target_patch_px=target_patch_px, device=device, n_eot=args.eot_samples,
                    cx_min=args.cx_min, cx_max=args.cx_max,
                    cy_min=args.cy_min, cy_max=args.cy_max,
                    oblique_eot=args.oblique_eot)
+
+    # Final eval on true INT8 quantised models
+    if quant_eval_models:
+        print("\n── INT8 PTQ eval (true quantisation, no STE) ──")
+        evaluate_patch(quant_eval_models, val_ds, patch_01.cpu(), target_label,
+                       target_patch_px=target_patch_px, device=torch.device('cpu'),
+                       n_eot=args.eot_samples,
+                       cx_min=args.cx_min, cx_max=args.cx_max,
+                       cy_min=args.cy_min, cy_max=args.cy_max,
+                       oblique_eot=args.oblique_eot)
 
 
 if __name__ == "__main__":
@@ -637,6 +735,8 @@ if __name__ == "__main__":
                    help="Margin for CW-style loss (logit gap target must exceed runner-up by)")
     p.add_argument("--no-fake-quant", action="store_true", default=False,
                    help="Disable fake-quant activation hooks (enabled by default)")
+    p.add_argument("--no-quant-eval", action="store_true", default=False,
+                   help="Skip building PTQ INT8 eval models (saves ~30s startup)")
     p.add_argument("--fake-quant-bits", default="6,8",
                    help="Comma-separated bit-widths to sample per layer per forward")
     p.add_argument("--fake-quant-p",  type=float, default=0.15,
