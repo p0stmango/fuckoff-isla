@@ -39,10 +39,13 @@ NORMALIZE = T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 
 train_transforms = T.Compose([
     T.Resize((IMG_SIZE, IMG_SIZE)),
-    T.ColorJitter(brightness=0.35, contrast=0.35, saturation=0.25, hue=0.06),
-    T.RandomRotation(12),
-    T.RandomPerspective(distortion_scale=0.25, p=0.5),
-    T.GaussianBlur(kernel_size=3, sigma=(0.1, 1.8)),
+    T.ColorJitter(brightness=0.45, contrast=0.45, saturation=0.30, hue=0.08),
+    T.RandomRotation(18),
+    T.RandomAffine(degrees=0, shear=15),
+    T.RandomPerspective(distortion_scale=0.40, p=0.6),
+    T.GaussianBlur(kernel_size=3, sigma=(0.1, 2.2)),
+    T.RandomGrayscale(p=0.3),     # Mobileye S-Cam4 is monochrome — train without colour
+    T.RandomAdjustSharpness(sharpness_factor=0.5, p=0.2),
     T.ToTensor(),
     NORMALIZE,
 ])
