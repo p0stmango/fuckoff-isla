@@ -310,6 +310,28 @@ def apply_differential_retroreflection(x: torch.Tensor,
     return torch.clamp(x, 0.0, 1.0)
 
 
+def apply_auto_exposure(x: torch.Tensor) -> torch.Tensor:
+    """
+    Simulate the S-Cam4 ISP's auto-exposure highlight compression.
+
+    When headlights hit a retroreflective sign, the raw sensor image has
+    extreme dynamic range.  The ISP's AE algorithm compresses highlights
+    to keep the sign readable without blowing out the frame.  This is a
+    non-linear tone curve applied BEFORE the classifier sees the crop.
+
+    Modelled as a soft knee compressor: pixels above `knee` are compressed
+    by `ratio`, smoothed with a tanh rolloff so it stays differentiable.
+    """
+    knee  = _rand(0.55, 0.80)   # AE knee point (bright pixels above here get compressed)
+    ratio = _rand(0.3, 0.7)     # compression strength (lower = harder compression)
+    # Soft knee: below knee → identity, above knee → compressed
+    excess = F.relu(x - knee)
+    compressed = knee + excess * ratio * torch.tanh(excess / (0.1 + excess * 0.5))
+    below = torch.min(x, torch.tensor(knee, device=x.device))
+    x = below + compressed
+    return torch.clamp(x, 0.0, 1.0)
+
+
 def apply_colour_temperature(x: torch.Tensor) -> torch.Tensor:
     shift = _rand(-0.06, 0.08)
     tint  = torch.tensor([shift, shift * 0.3, -shift * 0.8],
@@ -490,23 +512,29 @@ def _fake_quant_hook(bits_choices, p_apply, schedule):
         if not schedule.enabled or random.random() > p_apply:
             return out
         bits    = random.choice(bits_choices)
-        qmax    = float(2 ** bits - 1)
         out_det = out.detach()
 
-        # Percentile clip on a random subsample instead of raw min/max — a
-        # single outlier activation (easy to get from grayscale+CLAHE inputs)
-        # would otherwise set the step size for the whole tensor and wreck
-        # every other value in it.
+        # ── Symmetric per-tensor quantisation ──────────────────────────
+        # EyeQ4's fixed-function NPU (2018-era ASIC, ~2.5 TOPS @ 3W)
+        # almost certainly uses symmetric per-tensor INT8 — the simplest
+        # hardware scheme that doesn't need per-channel scale factors.
+        #
+        # Symmetric: range is [-amax, +amax], zero maps to integer 0.
+        # qmax = 2^(bits-1) - 1  (e.g. 127 for INT8).
+        #
+        # Percentile clip (99.5th) on a subsample avoids letting a single
+        # outlier set the scale for the whole tensor.
+        qmax = float(2 ** (bits - 1) - 1)              # 127 for 8-bit
+
         flat = out_det.reshape(-1).float()
         if flat.numel() > 4096:
             flat = flat[torch.randint(0, flat.numel(), (4096,), device=flat.device)]
-        lo = torch.quantile(flat, 0.01)
-        hi = torch.quantile(flat, 0.99)
+        amax = torch.quantile(flat.abs(), 0.995).clamp(min=1e-8)
 
-        scale   = (hi - lo) / qmax + 1e-8
-        clipped = out_det.clamp(lo, hi)
-        q       = torch.round((clipped - lo) / scale).clamp(0, qmax)
-        dq      = q * scale + lo
+        scale   = amax / qmax
+        clipped = out_det.clamp(-amax, amax)
+        q       = torch.round(clipped / scale).clamp(-qmax, qmax)
+        dq      = q * scale
         # Straight-through: forward = dq, backward = identity w.r.t. out.
         return out + (dq - out_det)
     return hook
@@ -584,6 +612,7 @@ LIGHTING_TRANSFORMS_BASE = [
     apply_brightness_gamma,
     apply_spotlight,
     apply_colour_temperature,
+    apply_auto_exposure,
 ]
 
 CAMERA_TRANSFORMS = [
