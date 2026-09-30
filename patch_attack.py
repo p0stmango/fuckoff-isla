@@ -176,6 +176,7 @@ def optimise_patch(
     cy_max:       float = 0.58,
     fake_quant_schedule = None,   # FakeQuantSchedule | None — flipped on after warmup
     fake_quant_warmup: int = 200,
+    oblique_eot: bool = False,    # mix in extreme off-axis (oblique) perspectives
 ) -> torch.Tensor:
     """
     patch_size is the PRINT resolution of the patch (e.g. 945 = 8cm @ 300 DPI).
@@ -198,6 +199,8 @@ def optimise_patch(
     print(f"Model footprint : {target_patch_px}px  in 224px input")
     print(f"Ensemble size   : {len(models)} model(s): "
           f"{[getattr(m, '_arch_name', '?') for m in models]}")
+    if oblique_eot:
+        print(f"Oblique EOT     : ON  (extreme off-axis perspectives mixed in ~40%)")
 
     for m in models:
         m.eval()
@@ -262,7 +265,7 @@ def optimise_patch(
                                       randomise_placement=False,
                                       target_patch_px=target_patch_px)
             patched_01  = patched * std + mean
-            patched_01  = eot_batch(patched_01.clone())
+            patched_01  = eot_batch(patched_01.clone(), oblique=oblique_eot)
             patched_eot = (patched_01 - mean) / std
 
             logits = surrogate(patched_eot)
@@ -298,7 +301,7 @@ def optimise_patch(
                                               randomise_placement=False,
                                               target_patch_px=target_patch_px)
                 patched_01_log  = patched_log * std + mean
-                patched_01_log  = eot_batch(patched_01_log)
+                patched_01_log  = eot_batch(patched_01_log, oblique=oblique_eot)
                 patched_eot_log = (patched_01_log - mean) / std
                 # Report ASR as the worst-case (minimum) across all surrogates
                 asr = min(
@@ -343,6 +346,7 @@ def evaluate_patch(
     cx_max:          float = 0.84,
     cy_min:          float = 0.35,
     cy_max:          float = 0.58,
+    oblique_eot:     bool  = False,
 ):
     """
     Evaluate ASR independently on each surrogate so you can see per-arch
@@ -383,7 +387,7 @@ def evaluate_patch(
                                               randomise_placement=False,
                                               target_patch_px=target_patch_px)
                     patched_01  = patched * std + mean
-                    patched_01  = eot_batch(patched_01)
+                    patched_01  = eot_batch(patched_01, oblique=oblique_eot)
                     patched_eot = (patched_01 - mean) / std
                     preds       = m(patched_eot).argmax(1)
                     eot_votes  += (preds == target_label).long()
@@ -478,6 +482,7 @@ def main(args):
         cy_max       = args.cy_max,
         fake_quant_schedule = fake_quant_schedule,
         fake_quant_warmup   = args.fake_quant_warmup,
+        oblique_eot         = args.oblique_eot,
     )
 
     torch.save(patch_01, args.out)
@@ -489,7 +494,8 @@ def main(args):
     evaluate_patch(ensemble, val_ds, patch_01, target_label,
                    target_patch_px=target_patch_px, device=device, n_eot=args.eot_samples,
                    cx_min=args.cx_min, cx_max=args.cx_max,
-                   cy_min=args.cy_min, cy_max=args.cy_max)
+                   cy_min=args.cy_min, cy_max=args.cy_max,
+                   oblique_eot=args.oblique_eot)
 
 
 if __name__ == "__main__":
@@ -535,4 +541,11 @@ if __name__ == "__main__":
                    help="Min patch centre Y fraction (0=top, 0.5=sign centre)")
     p.add_argument("--cy-max",        type=float, default=0.58,
                    help="Max patch centre Y fraction")
+    # Oblique EOT — extreme off-axis perspectives for signs perpendicular to
+    # the road viewed from close alongside (45–80° off the sign's normal).
+    # Complements the standard approach_left/right/steep_angle scenarios,
+    # which only reach ~30° off-axis.
+    p.add_argument("--oblique-eot",  action="store_true", default=False,
+                   help="Mix in extreme oblique viewing angles (~40%% of EOT "
+                        "geometry steps) for close roadside signs")
     main(p.parse_args())
