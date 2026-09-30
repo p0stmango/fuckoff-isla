@@ -35,7 +35,7 @@ from dataset import (
     KMH_TO_LABEL, ALL_SPEEDS, IMG_SIZE, NUM_CLASSES,
 )
 from model import build_surrogate, get_device, load as load_model, ARCH_CHOICES
-from eot import eot_batch, install_fake_quant_hooks, FakeQuantSchedule
+from eot import eot_batch, eot_print, eot_scene, install_fake_quant_hooks, FakeQuantSchedule
 
 # ── denormalise helper ───────────────────────────────────────────────────────
 _MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
@@ -285,11 +285,19 @@ def optimise_patch(
             # and trains across the full range of physical placement error.
             cx = random.uniform(cx_min, cx_max)
             cy = random.uniform(cy_min, cy_max)
-            patched     = apply_patch(imgs, patch_norm, cx_frac=cx, cy_frac=cy,
+
+            # Print EOT on the patch BEFORE compositing — only the patch
+            # goes through a printer; the sign is retroreflective aluminium.
+            patch_01_printed = eot_print(patch_01.clamp(0, 1))
+            patch_norm_eot   = to_normalised(patch_01_printed)
+
+            patched     = apply_patch(imgs, patch_norm_eot, cx_frac=cx, cy_frac=cy,
                                       randomise_placement=False,
                                       target_patch_px=target_patch_px)
+            # Scene EOT on the composited image — geometry, lighting, camera,
+            # sensor all happen to the sign+patch together in the real world.
             patched_01  = patched * std + mean
-            patched_01  = eot_batch(patched_01.clone(), oblique=oblique_eot)
+            patched_01  = eot_scene(patched_01.clone(), oblique=oblique_eot)
             patched_eot = (patched_01 - mean) / std
 
             logits = surrogate(patched_eot)
@@ -320,7 +328,8 @@ def optimise_patch(
 
         if step % 50 == 0:
             with torch.no_grad():
-                patch_norm_det  = to_normalised(patch_01.detach().clamp(0, 1))
+                patch_printed   = eot_print(patch_01.detach().clamp(0, 1))
+                patch_norm_det  = to_normalised(patch_printed)
                 cx_log = random.uniform(cx_min, cx_max)
                 cy_log = random.uniform(cy_min, cy_max)
                 patched_log     = apply_patch(imgs, patch_norm_det,
@@ -328,7 +337,7 @@ def optimise_patch(
                                               randomise_placement=False,
                                               target_patch_px=target_patch_px)
                 patched_01_log  = patched_log * std + mean
-                patched_01_log  = eot_batch(patched_01_log, oblique=oblique_eot)
+                patched_01_log  = eot_scene(patched_01_log, oblique=oblique_eot)
                 patched_eot_log = (patched_01_log - mean) / std
                 # Report ASR as the worst-case (minimum) across all surrogates
                 asr = min(
@@ -410,11 +419,14 @@ def evaluate_patch(
                 for _ in range(n_eot):
                     cx = random.uniform(cx_min, cx_max)
                     cy = random.uniform(cy_min, cy_max)
-                    patched     = apply_patch(imgs, patch_norm, cx_frac=cx, cy_frac=cy,
+                    # Print EOT on patch, then composite, then scene EOT
+                    patch_printed = eot_print(patch_01.to(device))
+                    patch_norm_ev = (patch_printed - mean) / std
+                    patched     = apply_patch(imgs, patch_norm_ev, cx_frac=cx, cy_frac=cy,
                                               randomise_placement=False,
                                               target_patch_px=target_patch_px)
                     patched_01  = patched * std + mean
-                    patched_01  = eot_batch(patched_01, oblique=oblique_eot)
+                    patched_01  = eot_scene(patched_01, oblique=oblique_eot)
                     patched_eot = (patched_01 - mean) / std
                     preds       = m(patched_eot).argmax(1)
                     eot_votes  += (preds == target_label).long()
