@@ -569,6 +569,14 @@ def _sym_fake_quant(x: torch.Tensor, bits: int, subsample: int = 4096):
 
 
 def _fake_quant_hook(bits_choices, p_apply, schedule):
+    # Cache quantised weights per (module, bits) — the surrogates are frozen
+    # during patch optimisation, so weights don't change between calls.
+    # Without this cache, _sym_fake_quant randomly subsamples 4096 weight
+    # elements each forward and gets a slightly different scale each time,
+    # injecting pure noise into the gradient that doesn't exist in real INT8
+    # (where weight scales are computed once at calibration and fixed).
+    _w_cache = {}
+
     def hook(module, inp, out):
         # Use schedule's ramped p if available, otherwise fall back to static p_apply
         effective_p = schedule.p if hasattr(schedule, 'p') else p_apply
@@ -586,10 +594,9 @@ def _fake_quant_hook(bits_choices, p_apply, schedule):
         # Result: qASR stuck at 0% because the patch never saw weight quant.
         #
         # Why the STE is correct now:
-        #   - _sym_fake_quant returns a detached tensor, so w_dq has no grad.
-        #   - F.conv2d(inp[0], w_dq, ...) computes the forward with quantised
-        #     weights.  Gradient w.r.t. inp[0] is W_quant^T @ grad_output —
-        #     the correct gradient direction for the quantised model.
+        #   - w_dq is detached (cached from _sym_fake_quant), no grad to weights.
+        #   - F.conv2d(inp[0], w_dq, ...) gives gradient w.r.t. inp[0] as
+        #     W_quant^T @ grad_output — correct for the quantised model.
         #   - Surrogate weights are frozen (no grad needed for them anyway).
         #   - The activation STE (out_wq + (out_dq - out_wq).detach()) gives
         #     forward = out_dq (fully quantised), backward = identity w.r.t.
@@ -597,8 +604,13 @@ def _fake_quant_hook(bits_choices, p_apply, schedule):
         #
         # EyeQ4 uses symmetric per-tensor INT8 — the simplest hardware scheme.
 
-        # Step 1: Weight quant — re-run forward with quantised weights
-        w_dq, _ = _sym_fake_quant(module.weight, bits)
+        # Step 1: Weight quant — cached per (module_id, bits) since weights
+        # are frozen.  Real INT8 calibrates weight scales once; so do we.
+        cache_key = (id(module), bits)
+        if cache_key not in _w_cache:
+            _w_cache[cache_key] = _sym_fake_quant(module.weight, bits)[0]
+        w_dq = _w_cache[cache_key]
+
         if isinstance(module, nn.Conv2d):
             out_wq = F.conv2d(inp[0], w_dq, module.bias,
                               module.stride, module.padding, module.dilation,
@@ -608,7 +620,8 @@ def _fake_quant_hook(bits_choices, p_apply, schedule):
         else:
             out_wq = out
 
-        # Step 2: Activation quant with STE
+        # Step 2: Activation quant with STE (activations change each forward —
+        # no cache, fresh scale each call, matching real per-batch calibration)
         out_dq, _ = _sym_fake_quant(out_wq, bits)
         # forward = out_dq (W+A quantised), backward = identity w.r.t. out_wq
         return out_wq + (out_dq - out_wq).detach()
