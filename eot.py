@@ -271,6 +271,7 @@ def apply_spotlight(x: torch.Tensor) -> torch.Tensor:
 
 
 def apply_retroreflection(x: torch.Tensor) -> torch.Tensor:
+    """Uniform retroreflection — legacy path when no patch mask is available."""
     B, C, H, W = x.shape
     sigma    = _rand(0.25, 0.55) * min(H, W)
     strength = _rand(0.0, 0.5)
@@ -280,6 +281,33 @@ def apply_retroreflection(x: torch.Tensor) -> torch.Tensor:
     retro = (0.1 + 2.2 * torch.exp(-dist2 / (2 * sigma**2))).view(1, 1, H, W).expand(B, C, H, W)
     light = 1.0 + strength * (retro - 1.0)
     return torch.clamp(x * light, 0.0, 1.0)
+
+
+def apply_differential_retroreflection(x: torch.Tensor,
+                                        patch_mask: torch.Tensor) -> torch.Tensor:
+    """
+    The sign's retroreflective aluminium sheeting glows under headlights;
+    the printed patch (matte paper / vinyl sticker) does not.  This creates
+    a stark brightness contrast the EyeQ4 camera sees at night or under
+    carpark lighting — the sign background is bright, the patch rectangle
+    stays dark.
+
+    patch_mask: (B, 1, H, W) — 1.0 where the patch is, 0.0 on sign background.
+    Must already be geometry-warped to match x.
+    """
+    B, C, H, W = x.shape
+    sigma    = _rand(0.25, 0.55) * min(H, W)
+    strength = _rand(0.15, 0.70)   # stronger range — real retro is dramatic
+    gy = torch.arange(H, device=x.device, dtype=x.dtype).view(H, 1).expand(H, W)
+    gx = torch.arange(W, device=x.device, dtype=x.dtype).view(1, W).expand(H, W)
+    dist2 = (gx - W / 2.0) ** 2 + (gy - H / 2.0) ** 2
+    retro = (0.1 + 2.2 * torch.exp(-dist2 / (2 * sigma ** 2)))
+    retro = retro.view(1, 1, H, W).expand(B, C, H, W)
+    boost = strength * (retro - 1.0)
+    # Only the sign background (non-patch) gets the retroreflective boost
+    sign_mask = 1.0 - patch_mask                       # (B, 1, H, W)
+    x = x * (1.0 + boost * sign_mask)
+    return torch.clamp(x, 0.0, 1.0)
 
 
 def apply_colour_temperature(x: torch.Tensor) -> torch.Tensor:
@@ -549,6 +577,15 @@ LIGHTING_TRANSFORMS = [
     apply_colour_temperature,
 ]
 
+# Lighting transforms that don't include retroreflection — used in eot_scene
+# when a patch mask is available and differential retroreflection is applied
+# as a separate step.
+LIGHTING_TRANSFORMS_BASE = [
+    apply_brightness_gamma,
+    apply_spotlight,
+    apply_colour_temperature,
+]
+
 CAMERA_TRANSFORMS = [
     apply_motion_blur,
     apply_defocus_blur,
@@ -564,15 +601,23 @@ def eot_print(x: torch.Tensor) -> torch.Tensor:
     and mounting curl.  Applied to the PATCH ONLY, before compositing onto the
     sign image.  The physical sign is retroreflective aluminium — it never
     passes through a printer.
+
+    A real inkjet print suffers ALL these artefacts simultaneously (gamut
+    compression AND dot gain AND banding etc.), not one at a time.  We sample
+    2–3 and apply them in sequence so the patch must survive the stacked
+    degradation, not just each artefact individually.
     """
-    x = random.choice(PRINT_TRANSFORMS)(x)
+    n = random.randint(2, min(3, len(PRINT_TRANSFORMS)))
+    for fn in random.sample(PRINT_TRANSFORMS, k=n):
+        x = fn(x)
     if random.random() < 0.6:
         x = apply_paper_curl(x)
     return torch.clamp(x, 0.0, 1.0)
 
 
 def eot_scene(x: torch.Tensor, n_transforms: int = 3,
-              oblique: bool = False) -> torch.Tensor:
+              oblique: bool = False,
+              patch_mask: torch.Tensor = None) -> torch.Tensor:
     """
     Scene-level EOT transforms — applied to the composited image (sign + patch
     together) because these happen in the physical world / camera, not the
@@ -585,7 +630,18 @@ def eot_scene(x: torch.Tensor, n_transforms: int = 3,
     left or right.  The sign is perpendicular to the road so the face is
     nearly edge-on — heavy horizontal foreshortening + convergence that the
     standard approach_left/right scenarios don't cover.
+
+    patch_mask: (B, 1, H, W) binary mask — 1.0 where the patch is, 0.0 on
+    sign background.  When provided, the mask is warped through the same
+    geometry transforms so differential retroreflection can distinguish
+    the retroreflective sign background from the matte printed patch.
     """
+    has_mask = patch_mask is not None
+
+    # ── concat mask as 4th channel so geometry warps it identically ────
+    if has_mask:
+        x = torch.cat([x, patch_mask], dim=1)          # (B, 4, H, W)
+
     # ── geometry (always all three, in order) ─────────────────────────────
     if oblique and random.random() < 0.4:
         x = apply_oblique_perspective(x)
@@ -594,8 +650,26 @@ def eot_scene(x: torch.Tensor, n_transforms: int = 3,
     x = apply_scale_jitter(x)
     x = apply_crop_jitter(x)
 
+    # ── split mask back out after geometry ─────────────────────────────
+    if has_mask:
+        warped_mask = (x[:, 3:4] > 0.5).float()        # threshold after interpolation
+        x = x[:, :3]
+
+    # ── retroreflection (separate from other lighting) ────────────────
+    # The sign's aluminium sheeting retroreflects; the printed patch doesn't.
+    # When we have the mask, apply differential retroreflection so the patch
+    # must survive the brightness contrast.  Without a mask, fall back to
+    # uniform retroreflection via the LIGHTING_TRANSFORMS list.
+    if has_mask and random.random() < 0.5:
+        x = apply_differential_retroreflection(x, warped_mask)
+
     # ── lighting (always one) ─────────────────────────────────────────────
-    x = random.choice(LIGHTING_TRANSFORMS)(x)
+    if has_mask:
+        # Retroreflection handled above — pick from base lighting only
+        x = random.choice(LIGHTING_TRANSFORMS_BASE)(x)
+    else:
+        # Legacy path — retroreflection mixed in with other lighting
+        x = random.choice(LIGHTING_TRANSFORMS)(x)
 
     # ── camera (one or two) ───────────────────────────────────────────────
     n_cam = 1 if n_transforms <= 3 else 2
