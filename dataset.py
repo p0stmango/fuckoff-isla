@@ -9,8 +9,10 @@ AU speed set:  5 10 15 20 25 30 40 50 60 70 80 90 100 110
 GTSRB speeds: 20    30    50 60 70 80   100 120     (no 5/10/15/25/40/90/110)
 """
 import os
+import random
 from pathlib import Path
 
+import cv2
 import numpy as np
 from PIL import Image
 import torch
@@ -19,6 +21,39 @@ import torchvision.transforms as T
 import torchvision.datasets as tvd
 
 from aus_signs import AU_SPEEDS, generate_dataset
+
+
+class RandomCLAHE:
+    """
+    Apply CLAHE with a given probability during training augmentation.
+
+    The target's ISP runs CLAHE on every frame.  Training the surrogates
+    with CLAHE augmentation ensures they learn features that survive local
+    contrast normalisation, closing the domain gap between training
+    (colour PIL images) and the EOT pipeline's CLAHE path.
+
+    clipLimit is randomised (1.5–3.0) to avoid overfitting to one setting.
+    """
+
+    def __init__(self, p: float = 0.4, clip_lo: float = 1.5, clip_hi: float = 3.0):
+        self.p = p
+        self.clip_lo = clip_lo
+        self.clip_hi = clip_hi
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        if random.random() > self.p:
+            return img
+        arr = np.array(img)
+        clip = random.uniform(self.clip_lo, self.clip_hi)
+        clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=(4, 4))
+        if arr.ndim == 2:
+            arr = clahe.apply(arr)
+        else:
+            # Apply to L channel in LAB space to preserve colour
+            lab = cv2.cvtColor(arr, cv2.COLOR_RGB2LAB)
+            lab[:, :, 0] = clahe.apply(lab[:, :, 0])
+            arr = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+        return Image.fromarray(arr)
 
 # ── label space (union of AU and GTSRB speeds we care about) ─────────────────
 # 120 km/h is GTSRB-only (no AU 120 limit) — include for model robustness.
@@ -44,7 +79,8 @@ train_transforms = T.Compose([
     T.RandomAffine(degrees=0, shear=15),
     T.RandomPerspective(distortion_scale=0.40, p=0.6),
     T.GaussianBlur(kernel_size=3, sigma=(0.1, 2.2)),
-    T.RandomGrayscale(p=0.3),     # Mobileye S-Cam4 is monochrome — train without colour
+    T.RandomGrayscale(p=0.5),     # ↑ from 0.3 — match eot.py 50% grayscale gate
+    RandomCLAHE(p=0.4),           # ISP CLAHE aug — surrogates must learn CLAHE-robust features
     T.RandomAdjustSharpness(sharpness_factor=0.5, p=0.2),
     T.ToTensor(),
     NORMALIZE,
