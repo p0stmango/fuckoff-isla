@@ -114,6 +114,65 @@ def apply_paper_curl(x: torch.Tensor) -> torch.Tensor:
 # GROUP 3 — GEOMETRIC TRANSFORMS
 # ════════════════════════════════════════════════════════════════════════════
 
+def apply_oblique_perspective(x: torch.Tensor) -> torch.Tensor:
+    """
+    Extreme off-axis viewing angles for signs perpendicular to the road —
+    i.e. when the car is passing a roadside sign close to the left or right.
+
+    Physically: the sign face is nearly edge-on, so the image is severely
+    foreshortened horizontally while the near vertical edge appears taller
+    than the far edge (perspective convergence).
+
+    Parameterised by off-axis angle θ (45–80° from the sign's normal) and
+    lateral distance d (1.5–4m).  For a 450mm sign at θ=70°, d=2m:
+      • apparent width  = 450 × cos(70°) ≈ 154mm  → heavy horizontal squeeze
+      • convergence     = d / (d + 450×sin(70°)) ≈ 0.83  → near edge ~20% taller
+    """
+    B, C, H, W = x.shape
+
+    side  = random.choice(["left", "right"])
+    theta = _rand(45.0, 80.0) * math.pi / 180.0   # off-axis angle in radians
+    d     = _rand(1.5, 4.0)                         # lateral distance in metres
+    sign_w = 0.45                                    # sign width in metres
+
+    # Horizontal foreshortening: how much of the sign width the camera sees
+    squeeze = math.cos(theta)                        # 0.17 – 0.71
+
+    # Perspective convergence: near edge vs far edge scale ratio
+    far_scale = d / (d + sign_w * math.sin(theta))   # 0.75 – 0.95
+    # near edge stays at scale ≈ 1.0
+
+    # Small vertical tilt — sign may be slightly above/below camera height
+    v_offset = _rand(-0.08, 0.08)
+
+    if side == "left":
+        # Camera is to the LEFT of the sign → left edge is near (larger)
+        dst = torch.tensor([
+            [-1.0,                     -1.0 + v_offset          ],   # TL (near, top)
+            [-1.0 + 2.0 * squeeze,     -1.0 * far_scale + v_offset],  # TR (far, top)
+            [-1.0 + 2.0 * squeeze,      1.0 * far_scale + v_offset],  # BR (far, bot)
+            [-1.0,                      1.0 + v_offset          ],   # BL (near, bot)
+        ], dtype=torch.float32, device=x.device)
+    else:
+        # Camera is to the RIGHT → right edge is near (larger)
+        dst = torch.tensor([
+            [ 1.0 - 2.0 * squeeze,     -1.0 * far_scale + v_offset],  # TL (far, top)
+            [ 1.0,                      -1.0 + v_offset          ],  # TR (near, top)
+            [ 1.0,                       1.0 + v_offset          ],  # BR (near, bot)
+            [ 1.0 - 2.0 * squeeze,       1.0 * far_scale + v_offset],  # BL (far, bot)
+        ], dtype=torch.float32, device=x.device)
+
+    dst = dst.clamp(-1.0, 1.0)
+    src = torch.tensor([
+        [-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]
+    ], dtype=torch.float32, device=x.device)
+
+    grid = _four_point_to_grid(src, dst, H, W, x.device)
+    grid = grid.unsqueeze(0).expand(B, -1, -1, -1)
+    return F.grid_sample(x, grid, align_corners=True, padding_mode="border",
+                         mode="bilinear")
+
+
 def apply_perspective_warp(x: torch.Tensor) -> torch.Tensor:
     B, C, H, W = x.shape
     scenario = random.choices(
@@ -499,10 +558,17 @@ CAMERA_TRANSFORMS = [
 ]
 
 
-def eot_batch(x: torch.Tensor, n_transforms: int = 3) -> torch.Tensor:
+def eot_batch(x: torch.Tensor, n_transforms: int = 3,
+              oblique: bool = False) -> torch.Tensor:
     """
     Apply transforms sampled from each physical stage in order.
     Physical causal chain: print → mount → geometry → lighting → camera → sensor.
+
+    oblique: if True, mix in extreme off-axis perspective transforms (~40% of
+    the time) to simulate the camera passing a roadside sign close to the
+    left or right.  The sign is perpendicular to the road so the face is
+    nearly edge-on — heavy horizontal foreshortening + convergence that the
+    standard approach_left/right scenarios don't cover.
     """
     # ── print artifacts (always one) ──────────────────────────────────────
     x = random.choice(PRINT_TRANSFORMS)(x)
@@ -512,7 +578,10 @@ def eot_batch(x: torch.Tensor, n_transforms: int = 3) -> torch.Tensor:
         x = apply_paper_curl(x)
 
     # ── geometry (always all three, in order) ─────────────────────────────
-    x = apply_perspective_warp(x)
+    if oblique and random.random() < 0.4:
+        x = apply_oblique_perspective(x)
+    else:
+        x = apply_perspective_warp(x)
     x = apply_scale_jitter(x)
     x = apply_crop_jitter(x)
 
