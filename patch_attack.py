@@ -154,6 +154,29 @@ def printability_loss(patch_01: torch.Tensor,
 
 # ── optimisation loop ────────────────────────────────────────────────────────
 
+def margin_loss(logits: torch.Tensor, target: torch.Tensor,
+                margin: float = 10.0) -> torch.Tensor:
+    """
+    CW-style margin loss: max(0, max_other - z_target + margin).
+
+    Pushes the target logit above the runner-up by at least `margin` logit
+    units.  Unlike cross-entropy, the gradient doesn't vanish once the target
+    class wins by a slim plurality — the optimiser keeps pushing until the
+    gap is large enough that small input perturbations (frame-to-frame
+    noise, viewing angle changes) can't flip the prediction.
+
+    This is *only* the loss function from Carlini & Wagner — the L2
+    minimisation / binary search machinery is not used because we have a
+    fixed patch footprint and don't care about perturbation norm.
+    """
+    B, C = logits.shape
+    # Mask out the target class to find the best non-target logit
+    one_hot  = F.one_hot(target, num_classes=C).bool()
+    z_target = logits[one_hot].view(B)                              # (B,)
+    z_other  = logits.masked_fill(one_hot, -1e9).max(dim=1).values  # (B,)
+    return F.relu(z_other - z_target + margin).mean()
+
+
 def optimise_patch(
     models:       list,
     dataset:      torch.utils.data.Dataset,
@@ -176,7 +199,8 @@ def optimise_patch(
     cy_max:       float = 0.58,
     fake_quant_schedule = None,   # FakeQuantSchedule | None — flipped on after warmup
     fake_quant_warmup: int = 200,
-    oblique_eot: bool = False,    # mix in extreme off-axis (oblique) perspectives
+    loss_fn:      str   = "ce",    # "ce" | "margin"
+    cw_margin:    float = 10.0,
 ) -> torch.Tensor:
     """
     patch_size is the PRINT resolution of the patch (e.g. 945 = 8cm @ 300 DPI).
@@ -197,10 +221,9 @@ def optimise_patch(
     target_patch_px = max(4, int(sign_input_px * patch_mm / sign_diam_mm))
     print(f"Print-res patch : {patch_size}px  ({print_cm}cm @ 300 DPI)")
     print(f"Model footprint : {target_patch_px}px  in 224px input")
+    print(f"Loss function   : {loss_fn}" + (f"  (margin={cw_margin})" if loss_fn == "margin" else ""))
     print(f"Ensemble size   : {len(models)} model(s): "
           f"{[getattr(m, '_arch_name', '?') for m in models]}")
-    if oblique_eot:
-        print(f"Oblique EOT     : ON  (extreme off-axis perspectives mixed in ~40%)")
 
     for m in models:
         m.eval()
@@ -265,11 +288,14 @@ def optimise_patch(
                                       randomise_placement=False,
                                       target_patch_px=target_patch_px)
             patched_01  = patched * std + mean
-            patched_01  = eot_batch(patched_01.clone(), oblique=oblique_eot)
+            patched_01  = eot_batch(patched_01.clone())
             patched_eot = (patched_01 - mean) / std
 
             logits = surrogate(patched_eot)
-            loss   = F.cross_entropy(logits, target_t.expand(B))
+            if loss_fn == "margin":
+                loss = margin_loss(logits, target_t.expand(B), margin=cw_margin)
+            else:
+                loss = F.cross_entropy(logits, target_t.expand(B))
             total_loss = total_loss + loss
 
         total_loss = total_loss / eot_samples
@@ -301,7 +327,7 @@ def optimise_patch(
                                               randomise_placement=False,
                                               target_patch_px=target_patch_px)
                 patched_01_log  = patched_log * std + mean
-                patched_01_log  = eot_batch(patched_01_log, oblique=oblique_eot)
+                patched_01_log  = eot_batch(patched_01_log)
                 patched_eot_log = (patched_01_log - mean) / std
                 # Report ASR as the worst-case (minimum) across all surrogates
                 asr = min(
@@ -346,7 +372,6 @@ def evaluate_patch(
     cx_max:          float = 0.84,
     cy_min:          float = 0.35,
     cy_max:          float = 0.58,
-    oblique_eot:     bool  = False,
 ):
     """
     Evaluate ASR independently on each surrogate so you can see per-arch
@@ -387,7 +412,7 @@ def evaluate_patch(
                                               randomise_placement=False,
                                               target_patch_px=target_patch_px)
                     patched_01  = patched * std + mean
-                    patched_01  = eot_batch(patched_01, oblique=oblique_eot)
+                    patched_01  = eot_batch(patched_01)
                     patched_eot = (patched_01 - mean) / std
                     preds       = m(patched_eot).argmax(1)
                     eot_votes  += (preds == target_label).long()
@@ -482,7 +507,8 @@ def main(args):
         cy_max       = args.cy_max,
         fake_quant_schedule = fake_quant_schedule,
         fake_quant_warmup   = args.fake_quant_warmup,
-        oblique_eot         = args.oblique_eot,
+        loss_fn             = args.loss,
+        cw_margin           = args.margin,
     )
 
     torch.save(patch_01, args.out)
@@ -494,8 +520,7 @@ def main(args):
     evaluate_patch(ensemble, val_ds, patch_01, target_label,
                    target_patch_px=target_patch_px, device=device, n_eot=args.eot_samples,
                    cx_min=args.cx_min, cx_max=args.cx_max,
-                   cy_min=args.cy_min, cy_max=args.cy_max,
-                   oblique_eot=args.oblique_eot)
+                   cy_min=args.cy_min, cy_max=args.cy_max)
 
 
 if __name__ == "__main__":
@@ -521,6 +546,10 @@ if __name__ == "__main__":
     # Model-side quantisation EOT — hooks each surrogate's Conv2d/Linear layers
     # so the optimiser sees int-N activation rounding, approximating an
     # embedded NPU without needing the real target's weights/calibration.
+    p.add_argument("--loss",          default="ce", choices=["ce", "margin"],
+                   help="Loss function: 'ce' (cross-entropy) or 'margin' (CW-style margin loss)")
+    p.add_argument("--margin",        type=float, default=10.0,
+                   help="Margin for CW-style loss (logit gap target must exceed runner-up by)")
     p.add_argument("--no-fake-quant", action="store_true", default=False,
                    help="Disable fake-quant activation hooks (enabled by default)")
     p.add_argument("--fake-quant-bits", default="6,8",
@@ -541,11 +570,4 @@ if __name__ == "__main__":
                    help="Min patch centre Y fraction (0=top, 0.5=sign centre)")
     p.add_argument("--cy-max",        type=float, default=0.58,
                    help="Max patch centre Y fraction")
-    # Oblique EOT — extreme off-axis perspectives for signs perpendicular to
-    # the road viewed from close alongside (45–80° off the sign's normal).
-    # Complements the standard approach_left/right/steep_angle scenarios,
-    # which only reach ~30° off-axis.
-    p.add_argument("--oblique-eot",  action="store_true", default=False,
-                   help="Mix in extreme oblique viewing angles (~40%% of EOT "
-                        "geometry steps) for close roadside signs")
     main(p.parse_args())
