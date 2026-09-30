@@ -498,18 +498,46 @@ def apply_clahe(x: torch.Tensor) -> torch.Tensor:
 
 class FakeQuantSchedule:
     """
-    Mutable on/off switch shared by every installed fake-quant hook, so the
-    training loop can warm up with clean activations and only enable
-    quantisation noise once the patch has found a stable regime — without
-    having to re-register hooks.
+    Shared state for every installed fake-quant hook.  Controls both the
+    on/off switch AND a linear ramp on p_apply so quantisation noise is
+    introduced gradually instead of slamming on at full strength.
+
+    Usage from the training loop:
+        schedule = FakeQuantSchedule(enabled=False, p_max=0.3, ramp_steps=500)
+        ...
+        # at warmup completion:
+        schedule.enabled = True
+        ...
+        # every step after that:
+        schedule.step()          # advances the ramp
+        current_p = schedule.p   # hooks read this
     """
-    def __init__(self, enabled: bool = True):
-        self.enabled = enabled
+    def __init__(self, enabled: bool = True, p_max: float = 0.3,
+                 ramp_steps: int = 500):
+        self.enabled    = enabled
+        self.p_max      = p_max
+        self.ramp_steps = max(ramp_steps, 1)
+        self._ramp_pos  = 0        # how many steps since enabled
+
+    @property
+    def p(self) -> float:
+        """Current effective p_apply — linearly ramps from 0.05 to p_max."""
+        if not self.enabled:
+            return 0.0
+        t = min(self._ramp_pos / self.ramp_steps, 1.0)
+        return 0.05 + (self.p_max - 0.05) * t
+
+    def step(self):
+        """Call once per training step after enabling."""
+        if self.enabled:
+            self._ramp_pos += 1
 
 
 def _fake_quant_hook(bits_choices, p_apply, schedule):
     def hook(module, inp, out):
-        if not schedule.enabled or random.random() > p_apply:
+        # Use schedule's ramped p if available, otherwise fall back to static p_apply
+        effective_p = schedule.p if hasattr(schedule, 'p') else p_apply
+        if not schedule.enabled or random.random() > effective_p:
             return out
         bits    = random.choice(bits_choices)
         out_det = out.detach()
@@ -550,16 +578,14 @@ def install_fake_quant_hooks(model: nn.Module,
     applied with probability p_apply per layer per forward call, and only while
     schedule.enabled is True.
 
+    When the schedule has a ramp (FakeQuantSchedule with ramp_steps > 0), the
+    effective probability starts at 0.05 and linearly increases to p_max over
+    ramp_steps training steps after enabling — call schedule.step() each
+    iteration. The static p_apply is used as fallback only for legacy schedules.
+
     Straight-through estimator keeps gradients flowing to the patch. Returns
     (handles, schedule) — pass handles to remove_fake_quant_hooks() to undo.
     If no schedule is given a fresh always-enabled one is created.
-
-    This is deliberately loose about matching any specific target's exact
-    quantisation scheme (per-tensor vs per-channel, symmetric vs asymmetric,
-    which layers get quantised) — none of that is knowable from outside the
-    hardware. Instead it samples across a spread of plausible configs so the
-    patch is optimised to survive quantisation noise in general rather than
-    overfitting to one guessed scheme.
     """
     if schedule is None:
         schedule = FakeQuantSchedule(enabled=True)
