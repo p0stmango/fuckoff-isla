@@ -219,6 +219,8 @@ def optimise_patch(
     loss_fn:      str   = "ce",    # "ce" | "margin"
     cw_margin:    float = 10.0,
     oblique_eot:  bool  = False,
+    init_patch:   str   = None,   # path to a saved patch tensor to resume from
+    ensemble_weights: list = None, # per-model sampling weights (default: uniform)
 ) -> torch.Tensor:
     """
     patch_size is the PRINT resolution of the patch (e.g. 945 = 8cm @ 300 DPI).
@@ -248,7 +250,17 @@ def optimise_patch(
         for p in m.parameters():
             p.requires_grad = False
 
-    patch_01 = torch.rand(1, 3, patch_size, patch_size, device=device) * 0.5 + 0.25
+    if init_patch is not None:
+        print(f"Initialising patch from: {init_patch}")
+        patch_01 = torch.load(init_patch, map_location=device)
+        if patch_01.dim() == 3:
+            patch_01 = patch_01.unsqueeze(0)
+        if patch_01.shape[-1] != patch_size:
+            patch_01 = F.interpolate(patch_01, size=(patch_size, patch_size),
+                                     mode="bilinear", align_corners=False)
+        patch_01 = patch_01.clamp(0, 1).to(device)
+    else:
+        patch_01 = torch.rand(1, 3, patch_size, patch_size, device=device) * 0.5 + 0.25
     patch_01.requires_grad_(True)
 
     optimizer = torch.optim.Adam([patch_01], lr=lr)
@@ -296,7 +308,9 @@ def optimise_patch(
         for _ in range(eot_samples):
             # Sample one surrogate per EOT step — prevents the patch from
             # exploiting any single model's blind spots.
-            surrogate = random.choice(models)
+            # When ensemble_weights is set, bias sampling toward the most
+            # architecturally-similar surrogate (e.g. MobileNetV3 for EyeQ4).
+            surrogate = random.choices(models, weights=ensemble_weights, k=1)[0]
             # Sample placement from the off-centre region where the patch
             # will actually be mounted — avoids overlaying the sign numeral
             # and trains across the full range of physical placement error.
@@ -553,6 +567,9 @@ def main(args):
         loss_fn             = args.loss,
         cw_margin           = args.margin,
         oblique_eot         = args.oblique_eot,
+        init_patch          = args.init_patch,
+        ensemble_weights    = [float(w) for w in args.ensemble_weights.split(",")]
+                              if args.ensemble_weights else None,
     )
 
     torch.save(patch_01, args.out)
@@ -591,6 +608,8 @@ if __name__ == "__main__":
     # Model-side quantisation EOT — hooks each surrogate's Conv2d/Linear layers
     # so the optimiser sees int-N activation rounding, approximating an
     # embedded NPU without needing the real target's weights/calibration.
+    p.add_argument("--init-patch",    default=None,
+                   help="Path to a saved patch tensor (.pt) to resume from instead of random init")
     p.add_argument("--loss",          default="ce", choices=["ce", "margin"],
                    help="Loss function: 'ce' (cross-entropy) or 'margin' (CW-style margin loss)")
     p.add_argument("--margin",        type=float, default=5.0,
@@ -607,6 +626,9 @@ if __name__ == "__main__":
     # will physically appear.  Defaults cover +60mm right / ±10mm vertical
     # with ±25mm human placement error.  cx/cy are fractions of image width/height
     # (0.5 = sign centre; 0.75 ≈ +60mm right on a 190mm sign at 224px input).
+    p.add_argument("--ensemble-weights", default=None,
+                   help="Comma-separated sampling weights per arch, e.g. '1,2,1' "
+                        "to sample the 2nd arch twice as often.  Default: uniform.")
     p.add_argument("--cx-min",        type=float, default=0.62,
                    help="Min patch centre X fraction (0=left edge, 0.5=sign centre)")
     p.add_argument("--cx-max",        type=float, default=0.84,
