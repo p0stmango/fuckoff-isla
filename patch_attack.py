@@ -1,5 +1,8 @@
 """
-Universal adversarial patch optimiser (targeted — misclassify any speed sign as 80 km/h).
+Universal adversarial patch optimiser (targeted or untargeted).
+Targeted: misclassify any speed sign as a specific class (default 80 km/h).
+Untargeted: misclassify as ANY wrong class — much easier to achieve physically
+because the optimizer has N-1 classes to push toward instead of 1.
 
 Algorithm: PGD-style iterative update with EOT on a RECTANGULAR patch applied
 to the sign image.  The patch is the only variable being optimised.
@@ -217,6 +220,24 @@ def printability_loss(patch_01: torch.Tensor,
 
 # ── optimisation loop ────────────────────────────────────────────────────────
 
+def untargeted_loss(logits: torch.Tensor, true_labels: torch.Tensor,
+                    margin: float = 5.0) -> torch.Tensor:
+    """
+    Untargeted CW-style margin loss: max(0, z_true - max_other + margin).
+
+    Pushes the true-class logit BELOW the best non-true class by at least
+    `margin` logit units.  The optimizer is free to pick whichever wrong
+    class is easiest to push above the true class — much easier than forcing
+    a specific target, especially against temporal majority voting where
+    per-frame success rate needs to be very high.
+    """
+    B, C = logits.shape
+    one_hot  = F.one_hot(true_labels, num_classes=C).bool()
+    z_true   = logits[one_hot].view(B)                              # (B,)
+    z_other  = logits.masked_fill(one_hot, -1e9).max(dim=1).values  # (B,)
+    return F.relu(z_true - z_other + margin).mean()
+
+
 def margin_loss(logits: torch.Tensor, target: torch.Tensor,
                 margin: float = 10.0) -> torch.Tensor:
     """
@@ -347,13 +368,14 @@ def optimise_patch(
             fake_quant_schedule.step()
 
         try:
-            imgs, _ = next(data_iter)
+            imgs, labels = next(data_iter)
         except StopIteration:
             data_iter = iter(loader)
-            imgs, _ = next(data_iter)
+            imgs, labels = next(data_iter)
 
-        imgs = imgs.to(device)
-        B    = imgs.size(0)
+        imgs   = imgs.to(device)
+        labels = labels.to(device)
+        B      = imgs.size(0)
 
         with torch.no_grad():
             patch_01.clamp_(0.0, 1.0)
@@ -393,7 +415,9 @@ def optimise_patch(
             patched_eot = (patched_01 - mean) / std
 
             logits = surrogate(patched_eot)
-            if loss_fn == "margin":
+            if loss_fn == "untargeted":
+                loss = untargeted_loss(logits, labels, margin=cw_margin)
+            elif loss_fn == "margin":
                 loss = margin_loss(logits, target_t.expand(B), margin=cw_margin)
             else:
                 loss = F.cross_entropy(logits, target_t.expand(B))
@@ -456,7 +480,11 @@ def optimise_patch(
                                                 training_step=step)
                     patched_eot_log = (patched_01_log - mean) / std
                     for mi, m in enumerate(models):
-                        _per_model_hits[mi] += (m(patched_eot_log).argmax(1) == target_label).sum().item()
+                        preds = m(patched_eot_log).argmax(1)
+                        if loss_fn == "untargeted":
+                            _per_model_hits[mi] += (preds != labels).sum().item()
+                        else:
+                            _per_model_hits[mi] += (preds == target_label).sum().item()
                 _per_model_total = B * _n_eval_eot
                 _per_model_asr = [h / _per_model_total for h in _per_model_hits]
                 asr = min(_per_model_asr)
@@ -488,7 +516,11 @@ def optimise_patch(
                                                     training_step=step)
                         patched_eot_log = (patched_01_log - mean) / std
                         for mi, m in enumerate(quant_eval_models):
-                            _q_hits[mi] += (m(patched_eot_log).argmax(1) == target_label).sum().item()
+                            preds_q = m(patched_eot_log).argmax(1)
+                            if loss_fn == "untargeted":
+                                _q_hits[mi] += (preds_q != labels).sum().item()
+                            else:
+                                _q_hits[mi] += (preds_q == target_label).sum().item()
                     for m in quant_eval_models:
                         for h in _qh[id(m)]:
                             h.remove()
@@ -550,6 +582,7 @@ def evaluate_patch(
     cy_min:          float = 0.35,
     cy_max:          float = 0.58,
     oblique_eot:     bool  = False,
+    loss_fn:         str   = "ce",
 ):
     """
     Evaluate ASR independently on each surrogate so you can see per-arch
@@ -599,12 +632,16 @@ def evaluate_patch(
                                             patch_mask=p_mask_ev)
                     patched_eot = (patched_01 - mean) / std
                     preds       = m(patched_eot).argmax(1)
-                    eot_votes  += (preds == target_label).long()
+                    if loss_fn == "untargeted":
+                        eot_votes += (preds != labels).long()
+                    else:
+                        eot_votes += (preds == target_label).long()
 
                 correct_targets[mi] += (eot_votes >= (n_eot // 2 + 1)).sum().item()
                 totals[mi]          += B
 
-    print(f"\n── Patch Evaluation (EOT + random placement) ──")
+    mode_str = "misclassify" if loss_fn == "untargeted" else f"target={ALL_SPEEDS[target_label]} km/h"
+    print(f"\n── Patch Evaluation (EOT + random placement, {mode_str}) ──")
     arch_names = [getattr(m, '_arch_name', f'model_{i}') for i, m in enumerate(models)]
     for mi, name in enumerate(arch_names):
         T = totals[mi]
@@ -613,7 +650,7 @@ def evaluate_patch(
 
     worst_asr = min(correct_targets[mi] / totals[mi] for mi in range(n_models))
     print(f"  Worst-case (ensemble) ASR : {worst_asr:.2%}  "
-          f"(target={ALL_SPEEDS[target_label]} km/h, majority vote {n_eot} EOT)")
+          f"({mode_str}, majority vote {n_eot} EOT)")
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -729,7 +766,8 @@ def main(args):
                    target_patch_px=target_patch_px, device=device, n_eot=args.eot_samples,
                    cx_min=args.cx_min, cx_max=args.cx_max,
                    cy_min=args.cy_min, cy_max=args.cy_max,
-                   oblique_eot=args.oblique_eot)
+                   oblique_eot=args.oblique_eot,
+                   loss_fn=args.loss)
 
     # Final eval with deterministic INT8 fake-quant
     if quant_eval_models:
@@ -740,7 +778,8 @@ def main(args):
                        n_eot=args.eot_samples,
                        cx_min=args.cx_min, cx_max=args.cx_max,
                        cy_min=args.cy_min, cy_max=args.cy_max,
-                       oblique_eot=args.oblique_eot)
+                       oblique_eot=args.oblique_eot,
+                       loss_fn=args.loss)
         for m in quant_eval_models:
             for h in _qh[id(m)]:
                 h.remove()
@@ -773,8 +812,9 @@ if __name__ == "__main__":
     # embedded NPU without needing the real target's weights/calibration.
     p.add_argument("--init-patch",    default=None,
                    help="Path to a saved patch tensor (.pt) to resume from instead of random init")
-    p.add_argument("--loss",          default="ce", choices=["ce", "margin"],
-                   help="Loss function: 'ce' (cross-entropy) or 'margin' (CW-style margin loss)")
+    p.add_argument("--loss",          default="ce", choices=["ce", "margin", "untargeted"],
+                   help="Loss function: 'ce' (cross-entropy on target), 'margin' (CW-style margin "
+                        "on target), 'untargeted' (push away from true class — any misclassification wins)")
     p.add_argument("--margin",        type=float, default=5.0,
                    help="Margin for CW-style loss (logit gap target must exceed runner-up by)")
     p.add_argument("--no-fake-quant", action="store_true", default=False,
