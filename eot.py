@@ -533,38 +533,62 @@ class FakeQuantSchedule:
             self._ramp_pos += 1
 
 
+def _sym_fake_quant(x: torch.Tensor, bits: int, subsample: int = 4096):
+    """
+    Symmetric per-tensor fake-quantise a tensor to `bits` width.
+    Returns (dequantised_detached, scale) — caller decides STE vs detach.
+    """
+    qmax = float(2 ** (bits - 1) - 1)              # 127 for 8-bit
+    flat = x.detach().reshape(-1).float()
+    if flat.numel() > subsample:
+        flat = flat[torch.randint(0, flat.numel(), (subsample,), device=flat.device)]
+    amax    = torch.quantile(flat.abs(), 0.995).clamp(min=1e-8)
+    scale   = amax / qmax
+    clipped = x.detach().clamp(-amax, amax)
+    q       = torch.round(clipped / scale).clamp(-qmax, qmax)
+    return q * scale, scale
+
+
 def _fake_quant_hook(bits_choices, p_apply, schedule):
     def hook(module, inp, out):
         # Use schedule's ramped p if available, otherwise fall back to static p_apply
         effective_p = schedule.p if hasattr(schedule, 'p') else p_apply
         if not schedule.enabled or random.random() > effective_p:
             return out
-        bits    = random.choice(bits_choices)
-        out_det = out.detach()
+        bits = random.choice(bits_choices)
 
         # ── Symmetric per-tensor quantisation ──────────────────────────
         # EyeQ4's fixed-function NPU (2018-era ASIC, ~2.5 TOPS @ 3W)
-        # almost certainly uses symmetric per-tensor INT8 — the simplest
-        # hardware scheme that doesn't need per-channel scale factors.
+        # uses symmetric per-tensor INT8 — the simplest hardware scheme
+        # that doesn't need per-channel scale factors.
         #
-        # Symmetric: range is [-amax, +amax], zero maps to integer 0.
-        # qmax = 2^(bits-1) - 1  (e.g. 127 for INT8).
-        #
-        # Percentile clip (99.5th) on a subsample avoids letting a single
-        # outlier set the scale for the whole tensor.
-        qmax = float(2 ** (bits - 1) - 1)              # 127 for 8-bit
+        # We fake-quant BOTH weights and activations to match real INT8
+        # inference, where the matmul/conv operates on quantised weights
+        # and quantised input activations.
 
-        flat = out_det.reshape(-1).float()
-        if flat.numel() > 4096:
-            flat = flat[torch.randint(0, flat.numel(), (4096,), device=flat.device)]
-        amax = torch.quantile(flat.abs(), 0.995).clamp(min=1e-8)
+        # ── Weight fake-quant (STE) ──────────────────────────────────
+        # Quantise the layer's weight in-place for this forward pass,
+        # then restore after.  STE: gradients pass through as if the
+        # weight wasn't quantised (they flow to the patch, not the weight).
+        w = module.weight
+        w_dq, _ = _sym_fake_quant(w, bits)
+        w_orig = w.data.clone()
+        w.data = w_dq
+        # Re-run the layer with quantised weights to get the correct output
+        if isinstance(module, nn.Conv2d):
+            out_wq = F.conv2d(inp[0], w.data, module.bias, module.stride,
+                              module.padding, module.dilation, module.groups)
+        elif isinstance(module, nn.Linear):
+            out_wq = F.linear(inp[0], w.data, module.bias)
+        else:
+            out_wq = out  # fallback — shouldn't happen
+        # Restore original weights immediately
+        w.data = w_orig
 
-        scale   = amax / qmax
-        clipped = out_det.clamp(-amax, amax)
-        q       = torch.round(clipped / scale).clamp(-qmax, qmax)
-        dq      = q * scale
+        # ── Activation fake-quant (STE) ──────────────────────────────
+        out_dq, _ = _sym_fake_quant(out_wq, bits)
         # Straight-through: forward = dq, backward = identity w.r.t. out.
-        return out + (dq - out_det)
+        return out + (out_dq - out.detach())
     return hook
 
 
