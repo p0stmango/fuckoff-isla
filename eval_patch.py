@@ -99,7 +99,7 @@ def main(args):
                                      randomise_placement=False,
                                      target_patch_px=target_patch_px)
             patched_01 = patched * std + mean
-            patched_01 = eot_batch(patched_01.clone())
+            patched_01 = eot_batch(patched_01.clone(), oblique=args.oblique_eot)
             patched_eot = (patched_01 - mean) / std
 
             for name, m in models.items():
@@ -133,4 +133,6 @@ if __name__ == "__main__":
                    help="Number of EOT samples for the vote")
     p.add_argument("--print-cm",      type=float, default=8.0)
     p.add_argument("--sign-diam-mm",  type=float, default=190.0)
+    p.add_argument("--oblique-eot",  action="store_true", default=False,
+                   help="Mix in extreme oblique viewing angles for close roadside signs")
     main(p.parse_args())
