@@ -1,187 +1,579 @@
 """
-Dataset loader merging GTSRB speed-limit classes with synthetic Australian signs.
+Universal adversarial patch optimiser (targeted — misclassify any speed sign as 80 km/h).
 
-GTSRB provides real-photo diversity for the overlapping speed classes.
-Australian synthetic data (aus_signs.py) adds AU-only classes and the
-correct "km/h" sub-label style for transfer to the EyeQ4 AU firmware.
+Algorithm: PGD-style iterative update with EOT on a RECTANGULAR patch applied
+to the sign image.  The patch is the only variable being optimised.
 
-AU speed set:  5 10 15 20 25 30 40 50 60 70 80 90 100 110
-GTSRB speeds: 20    30    50 60 70 80   100 120     (no 5/10/15/25/40/90/110)
+Usage:
+    python patch_attack.py \
+        --model surrogate.pt \
+        --arch  resnet18,resnet50,mobilenet_v3_small \
+        --data  ./data \
+        --out   patch.pt \
+        [--patch-size 945] \
+        [--steps 2000] \
+        [--lr 0.01] \
+        [--eot-samples 16] \
+        [--batch 32] \
+        [--tv-weight 0.05] \
+        [--nps-weight 0.01]
 """
-import os
+import argparse
+import math
+import random
 from pathlib import Path
 
-import numpy as np
-from PIL import Image
 import torch
-from torch.utils.data import Dataset, DataLoader, ConcatDataset, WeightedRandomSampler
+import torch.nn.functional as F
 import torchvision.transforms as T
-import torchvision.datasets as tvd
+from tqdm import tqdm
+from PIL import Image
+import numpy as np
 
-from aus_signs import AU_SPEEDS, generate_dataset
+from dataset import (
+    AUSynthDataset, FilteredGTSRB, val_transforms, NORMALIZE,
+    KMH_TO_LABEL, ALL_SPEEDS, IMG_SIZE, NUM_CLASSES,
+)
+from model import build_surrogate, get_device, load as load_model, ARCH_CHOICES
+from eot import eot_batch, install_fake_quant_hooks, FakeQuantSchedule
 
-# ── label space (union of AU and GTSRB speeds we care about) ─────────────────
-# 120 km/h is GTSRB-only (no AU 120 limit) — include for model robustness.
-ALL_SPEEDS   = sorted(set(AU_SPEEDS))
-KMH_TO_LABEL = {kmh: i for i, kmh in enumerate(ALL_SPEEDS)}
-NUM_CLASSES  = len(ALL_SPEEDS)
-
-# Source-5 km/h is our known carpark sign; we want ANY sign → fool classifier
-# Default attack target — override in patch_attack.py CLI
-DEFAULT_TARGET_KMH = 50
-
-# GTSRB class IDs that are speed-limit signs (skip class 6 = end-of-80)
-GTSRB_SPEED_CLASSES = {0, 1, 2, 3, 4, 5, 7}
-GTSRB_ID_TO_KMH     = {0: 20, 1: 30, 2: 50, 3: 60, 4: 70, 5: 80, 7: 100}
-
-IMG_SIZE  = 224
-NORMALIZE = T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-
-train_transforms = T.Compose([
-    T.Resize((IMG_SIZE, IMG_SIZE)),
-    T.ColorJitter(brightness=0.45, contrast=0.45, saturation=0.30, hue=0.08),
-    T.RandomRotation(18),
-    T.RandomAffine(degrees=0, shear=15),
-    T.RandomPerspective(distortion_scale=0.40, p=0.6),
-    T.GaussianBlur(kernel_size=3, sigma=(0.1, 2.2)),
-    T.RandomGrayscale(p=0.3),     # Mobileye S-Cam4 is monochrome — train without colour
-    T.RandomAdjustSharpness(sharpness_factor=0.5, p=0.2),
-    T.ToTensor(),
-    NORMALIZE,
-])
-
-val_transforms = T.Compose([
-    T.Resize((IMG_SIZE, IMG_SIZE)),
-    T.ToTensor(),
-    NORMALIZE,
-])
+# ── denormalise helper ───────────────────────────────────────────────────────
+_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+_STD  = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 
 
-# ── GTSRB subset ─────────────────────────────────────────────────────────────
-
-class FilteredGTSRB(Dataset):
-    """GTSRB speed-limit subset, labels remapped to the AU+GTSRB union space."""
-
-    def __init__(self, root: str, split: str = "train", transform=None, download: bool = False):
-        self.base      = tvd.GTSRB(root=root, split=split, download=download)
-        self.transform = transform
-        self.indices   = [
-            i for i, (_, cls) in enumerate(self.base._samples)  # noqa: SLF001
-            if cls in GTSRB_SPEED_CLASSES
-        ]
-
-    def __len__(self):
-        return len(self.indices)
-
-    def __getitem__(self, idx):
-        img, gtsrb_cls = self.base[self.indices[idx]]
-        label = KMH_TO_LABEL[GTSRB_ID_TO_KMH[gtsrb_cls]]
-        if self.transform:
-            img = self.transform(img)
-        return img, label
+def denormalize(t: torch.Tensor) -> torch.Tensor:
+    return t.cpu() * _STD + _MEAN
 
 
-# ── Australian synthetic subset ───────────────────────────────────────────────
+# ── patch application (rectangular — no mask) ────────────────────────────────
 
-class AUSynthDataset(Dataset):
+def apply_patch(
+    images: torch.Tensor,          # (B, 3, H, W)  normalised
+    patch_norm: torch.Tensor,      # (1, 3, P, P)  normalised patch — may be print-res
+    cx_frac: float = 0.5,
+    cy_frac: float = 0.5,
+    randomise_placement: bool = False,
+    target_patch_px: int = None,   # if set, downsample patch to this size first
+) -> torch.Tensor:
     """
-    ImageFolder-style loader over ./data/aus_synth/<speed>/*.png.
-    Call generate_dataset() first (or pass auto_generate=True).
+    Place the rectangular patch centred at (cx_frac, cy_frac).
+    No circular mask — full rectangle is applied.
+
+    target_patch_px: the patch footprint in the model's input space (px).
+    When patch_norm is at print resolution (e.g. 945px) and the model sees
+    224px images, pass target_patch_px=32 to downsample through a
+    differentiable bilinear interpolation before compositing.  Gradients
+    flow back through the interpolation to update the full-res patch tensor.
     """
+    B, C, H, W = images.shape
 
-    def __init__(
-        self,
-        root:          str   = "./data/aus_synth",
-        transform             = None,
-        val_fraction:  float = 0.15,
-        split:         str   = "train",
-        auto_generate: bool  = False,
-        n_per_class:   int   = 400,
-    ):
-        self.transform = transform
-        root_p = Path(root)
+    # Downsample print-res patch to model input footprint (differentiable)
+    if target_patch_px is not None and patch_norm.shape[-1] != target_patch_px:
+        patch_small = F.interpolate(
+            patch_norm, size=(target_patch_px, target_patch_px),
+            mode="bilinear", align_corners=False,
+        )
+    else:
+        patch_small = patch_norm
 
-        if auto_generate:
-            generate_dataset(root, n_per_class=n_per_class)
+    P = patch_small.shape[-1]
 
-        self.samples: list[tuple[str, int]] = []
-        for speed in AU_SPEEDS:
-            class_dir = root_p / str(speed)
-            if not class_dir.exists():
-                continue
-            label = KMH_TO_LABEL[speed]
-            files = sorted(class_dir.glob("*.png"))
-            n_val = max(1, int(len(files) * val_fraction))
-            if split == "train":
-                files = files[n_val:]
+    patched     = images.clone()
+    patch_tiled = patch_small.expand(B, -1, -1, -1)
+
+    if not randomise_placement:
+        top  = max(0, min(int(cy_frac * H - P / 2), H - P))
+        left = max(0, min(int(cx_frac * W - P / 2), W - P))
+        patched[:, :, top:top + P, left:left + P] = patch_tiled
+    else:
+        margin = int(H * 0.20)
+        for b in range(B):
+            top  = random.randint(margin, max(margin, H - P - margin))
+            left = random.randint(margin, max(margin, W - P - margin))
+            patched[b:b+1, :, top:top + P, left:left + P] = patch_tiled[b:b+1]
+
+    return patched
+
+
+# ── losses ───────────────────────────────────────────────────────────────────
+
+def tv_loss(patch_01: torch.Tensor) -> torch.Tensor:
+    """
+    Total Variation loss — penalises pixel-to-pixel differences at print resolution.
+    Forces spatial coherence so the optimiser can't exploit high-frequency noise
+    that averages away through the bilinear downsample.
+    """
+    dh = (patch_01[:, :, 1:, :] - patch_01[:, :, :-1, :]).abs().mean()
+    dw = (patch_01[:, :, :, 1:] - patch_01[:, :, :, :-1]).abs().mean()
+    return dh + dw
+
+
+# Colours reproducible by a typical inkjet on matte paper (sRGB [0,1]).
+# Source: Eykholt et al. 2018 supplementary + common inkjet characterisation.
+_PRINTABLE_COLOURS = torch.tensor([
+    [0.000, 0.000, 0.000],  # black
+    [1.000, 1.000, 1.000],  # white
+    [1.000, 0.000, 0.000],  # red
+    [0.000, 1.000, 0.000],  # green
+    [0.000, 0.000, 1.000],  # blue
+    [1.000, 1.000, 0.000],  # yellow
+    [0.000, 1.000, 1.000],  # cyan
+    [1.000, 0.000, 1.000],  # magenta
+    [0.800, 0.000, 0.000],  # dark red
+    [0.000, 0.600, 0.000],  # dark green
+    [0.000, 0.000, 0.800],  # dark blue
+    [0.900, 0.500, 0.000],  # orange
+    [0.600, 0.300, 0.000],  # brown
+    [0.500, 0.500, 0.500],  # mid grey
+    [0.750, 0.750, 0.750],  # light grey
+    [0.250, 0.250, 0.250],  # dark grey
+    [1.000, 0.600, 0.600],  # light red / pink
+    [0.600, 0.800, 1.000],  # light blue
+    [0.600, 1.000, 0.600],  # light green
+    [1.000, 0.900, 0.600],  # cream / light yellow
+], dtype=torch.float32)
+
+
+def printability_loss(patch_01: torch.Tensor,
+                      printable_colours: torch.Tensor = None) -> torch.Tensor:
+    """
+    Non-Printability Score (NPS) from Eykholt et al.
+    For each pixel, find the minimum squared distance to any printable colour.
+    Returns mean over all pixels — differentiable w.r.t. patch_01.
+    """
+    if printable_colours is None:
+        printable_colours = _PRINTABLE_COLOURS
+    pc = printable_colours.to(patch_01.device)
+
+    pixels = patch_01.squeeze(0).permute(1, 2, 0).reshape(-1, 3)  # (N, 3)
+    diff   = pixels.unsqueeze(1) - pc.unsqueeze(0)                # (N, P, 3)
+    dist   = (diff ** 2).sum(-1)                                   # (N, P)
+    return dist.min(dim=1).values.mean()
+
+
+# ── optimisation loop ────────────────────────────────────────────────────────
+
+def margin_loss(logits: torch.Tensor, target: torch.Tensor,
+                margin: float = 10.0) -> torch.Tensor:
+    """
+    CW-style margin loss: max(0, max_other - z_target + margin).
+
+    Pushes the target logit above the runner-up by at least `margin` logit
+    units.  Unlike cross-entropy, the gradient doesn't vanish once the target
+    class wins by a slim plurality — the optimiser keeps pushing until the
+    gap is large enough that small input perturbations (frame-to-frame
+    noise, viewing angle changes) can't flip the prediction.
+
+    This is *only* the loss function from Carlini & Wagner — the L2
+    minimisation / binary search machinery is not used because we have a
+    fixed patch footprint and don't care about perturbation norm.
+    """
+    B, C = logits.shape
+    # Mask out the target class to find the best non-target logit
+    one_hot  = F.one_hot(target, num_classes=C).bool()
+    z_target = logits[one_hot].view(B)                              # (B,)
+    z_other  = logits.masked_fill(one_hot, -1e9).max(dim=1).values  # (B,)
+    return F.relu(z_other - z_target + margin).mean()
+
+
+def optimise_patch(
+    models:       list,
+    dataset:      torch.utils.data.Dataset,
+    target_label: int,
+    patch_size:   int   = 945,
+    steps:        int   = 2000,
+    lr:           float = 0.01,
+    eot_samples:  int   = 16,
+    batch_size:   int   = 32,
+    device:       torch.device = None,
+    universal:    bool  = True,
+    print_cm:     float = 8.0,
+    sign_diam_mm: float = 190.0,
+    real_sign_mm: float = 450.0,
+    nps_weight:   float = 0.01,
+    tv_weight:    float = 0.05,
+    cx_min:       float = 0.62,
+    cx_max:       float = 0.84,
+    cy_min:       float = 0.35,
+    cy_max:       float = 0.58,
+    fake_quant_schedule = None,   # FakeQuantSchedule | None — flipped on after warmup
+    fake_quant_warmup: int = 200,
+    loss_fn:      str   = "ce",    # "ce" | "margin"
+    cw_margin:    float = 10.0,
+    oblique_eot:  bool  = False,
+) -> torch.Tensor:
+    """
+    patch_size is the PRINT resolution of the patch (e.g. 945 = 8cm @ 300 DPI).
+    During optimisation it is downsampled via bilinear interpolation to the
+    correct footprint in the 224px model input, so gradients flow through the
+    resize back to the full-res tensor.  What you optimise is literally what
+    you print — no separate upscale step.
+
+    TV loss forces spatial coherence at print resolution, preventing the
+    optimiser from exploiting high-frequency noise that averages away through
+    the bilinear downsample.
+    """
+    if device is None:
+        device = get_device()
+
+    patch_mm        = print_cm * 10.0
+    sign_input_px   = int(224 * 0.80)                  # ~179px sign in 224px input
+    target_patch_px = max(4, int(sign_input_px * patch_mm / sign_diam_mm))
+    print(f"Print-res patch : {patch_size}px  ({print_cm}cm @ 300 DPI)")
+    print(f"Model footprint : {target_patch_px}px  in 224px input")
+    print(f"Loss function   : {loss_fn}" + (f"  (margin={cw_margin})" if loss_fn == "margin" else ""))
+    print(f"Ensemble size   : {len(models)} model(s): "
+          f"{[getattr(m, '_arch_name', '?') for m in models]}")
+
+    for m in models:
+        m.eval()
+        for p in m.parameters():
+            p.requires_grad = False
+
+    patch_01 = torch.rand(1, 3, patch_size, patch_size, device=device) * 0.5 + 0.25
+    patch_01.requires_grad_(True)
+
+    optimizer = torch.optim.Adam([patch_01], lr=lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=steps)
+
+    sub_ds = dataset if universal else torch.utils.data.Subset(
+        dataset, [i for i, (_, l) in enumerate(dataset) if l != target_label]
+    )
+
+    loader = torch.utils.data.DataLoader(
+        sub_ds, batch_size=batch_size, shuffle=True,
+        num_workers=0, drop_last=True,
+    )
+    data_iter = iter(loader)
+
+    target_t = torch.tensor([target_label], device=device)
+    mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+    std  = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+
+    def to_normalised(p_01):
+        return (p_01 - mean) / std
+
+    pbar = tqdm(range(1, steps + 1), desc="Optimising patch")
+    for step in pbar:
+        if (fake_quant_schedule is not None and not fake_quant_schedule.enabled
+                and step >= fake_quant_warmup):
+            fake_quant_schedule.enabled = True
+            pbar.write(f"[step {step}] fake-quant hooks enabled (warmup complete)")
+
+        try:
+            imgs, _ = next(data_iter)
+        except StopIteration:
+            data_iter = iter(loader)
+            imgs, _ = next(data_iter)
+
+        imgs = imgs.to(device)
+        B    = imgs.size(0)
+
+        with torch.no_grad():
+            patch_01.clamp_(0.0, 1.0)
+
+        patch_norm = to_normalised(patch_01)
+        total_loss = torch.tensor(0.0, device=device)
+
+        for _ in range(eot_samples):
+            # Sample one surrogate per EOT step — prevents the patch from
+            # exploiting any single model's blind spots.
+            surrogate = random.choice(models)
+            # Sample placement from the off-centre region where the patch
+            # will actually be mounted — avoids overlaying the sign numeral
+            # and trains across the full range of physical placement error.
+            cx = random.uniform(cx_min, cx_max)
+            cy = random.uniform(cy_min, cy_max)
+            patched     = apply_patch(imgs, patch_norm, cx_frac=cx, cy_frac=cy,
+                                      randomise_placement=False,
+                                      target_patch_px=target_patch_px)
+            patched_01  = patched * std + mean
+            patched_01  = eot_batch(patched_01.clone(), oblique=oblique_eot)
+            patched_eot = (patched_01 - mean) / std
+
+            logits = surrogate(patched_eot)
+            if loss_fn == "margin":
+                loss = margin_loss(logits, target_t.expand(B), margin=cw_margin)
             else:
-                files = files[:n_val]
-            for f in files:
-                self.samples.append((str(f), label))
+                loss = F.cross_entropy(logits, target_t.expand(B))
+            total_loss = total_loss + loss
 
-    def __len__(self):
-        return len(self.samples)
+        total_loss = total_loss / eot_samples
 
-    def __getitem__(self, idx):
-        path, label = self.samples[idx]
-        img = Image.open(path).convert("RGB")
-        if self.transform:
-            img = self.transform(img)
-        return img, label
+        # TV loss — force spatial coherence at print resolution
+        if tv_weight > 0:
+            total_loss = total_loss + tv_weight * tv_loss(patch_01.clamp(0, 1))
+
+        # NPS — penalise colours inkjet can't reproduce
+        if nps_weight > 0:
+            total_loss = total_loss + nps_weight * printability_loss(patch_01.clamp(0, 1))
+
+        optimizer.zero_grad()
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_([patch_01], max_norm=10.0)
+        optimizer.step()
+        scheduler.step()
+
+        with torch.no_grad():
+            patch_01.clamp_(0.0, 1.0)
+
+        if step % 50 == 0:
+            with torch.no_grad():
+                patch_norm_det  = to_normalised(patch_01.detach().clamp(0, 1))
+                cx_log = random.uniform(cx_min, cx_max)
+                cy_log = random.uniform(cy_min, cy_max)
+                patched_log     = apply_patch(imgs, patch_norm_det,
+                                              cx_frac=cx_log, cy_frac=cy_log,
+                                              randomise_placement=False,
+                                              target_patch_px=target_patch_px)
+                patched_01_log  = patched_log * std + mean
+                patched_01_log  = eot_batch(patched_01_log, oblique=oblique_eot)
+                patched_eot_log = (patched_01_log - mean) / std
+                # Report ASR as the worst-case (minimum) across all surrogates
+                asr = min(
+                    (m(patched_eot_log).argmax(1) == target_label).float().mean().item()
+                    for m in models
+                )
+            pbar.set_postfix(loss=f"{total_loss.item():.4f}", ASR=f"{asr:.2%}")
+
+            arr = patch_01.detach().clamp(0, 1).squeeze(0).permute(1, 2, 0).cpu().numpy()
+            Image.fromarray((arr * 255).astype(np.uint8)).save(f"patch_step_{step:04d}.png")
+
+    return patch_01.detach().clamp(0, 1), target_patch_px
 
 
-# ── combined dataloader ───────────────────────────────────────────────────────
+# ── export ────────────────────────────────────────────────────────────────────
 
-def make_dataloaders(
-    gtsrb_root:    str   = "./data",
-    aus_root:      str   = "./data/aus_synth",
-    batch_size:    int   = 64,
-    num_workers:   int   = 4,
-    download:      bool  = True,
-    auto_generate: bool  = True,
-    n_aus_per_cls: int   = 400,
+def save_patch_png(patch_01: torch.Tensor, path: str, print_cm: float = 8.0):
+    """Patch tensor is already at print resolution — save directly, no upscale."""
+    arr = patch_01.squeeze(0).permute(1, 2, 0).numpy()
+    arr = (arr * 255).clip(0, 255).astype(np.uint8)
+    img = Image.fromarray(arr)
+    dpi = 300
+    px  = int(print_cm / 2.54 * dpi)
+    if img.size != (px, px):
+        img = img.resize((px, px), resample=Image.LANCZOS)
+    img.save(path, dpi=(dpi, dpi))
+    print(f"Saved print-ready patch: {path}  ({img.size[0]}×{img.size[1]} px @ {dpi} DPI)")
+
+
+# ── evaluate ──────────────────────────────────────────────────────────────────
+
+def evaluate_patch(
+    models:          list,
+    dataset:         torch.utils.data.Dataset,
+    patch_01:        torch.Tensor,
+    target_label:    int,
+    target_patch_px: int   = 32,
+    device:          torch.device = None,
+    batch_size:      int   = 64,
+    n_eot:           int   = 16,
+    cx_min:          float = 0.62,
+    cx_max:          float = 0.84,
+    cy_min:          float = 0.35,
+    cy_max:          float = 0.58,
+    oblique_eot:     bool  = False,
 ):
     """
-    Returns (train_loader, val_loader) over the merged GTSRB + AU dataset.
-
-    GTSRB covers: 20 30 50 60 70 80 100 120
-    AU synth covers: 5 10 15 20 25 30 40 50 60 70 80 90 100 110
-    Overlap classes get both real and synthetic samples — improves robustness.
+    Evaluate ASR independently on each surrogate so you can see per-arch
+    transfer, then report the ensemble (worst-case) figure.
     """
-    train_gtsrb = FilteredGTSRB(gtsrb_root, split="train", transform=train_transforms, download=download)
-    val_gtsrb   = FilteredGTSRB(gtsrb_root, split="test",  transform=val_transforms,   download=download)
+    if device is None:
+        device = get_device()
 
-    train_aus = AUSynthDataset(
-        aus_root, transform=train_transforms, split="train",
-        auto_generate=auto_generate, n_per_class=n_aus_per_cls,
+    mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+    std  = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+    patch_norm = (patch_01.to(device) - mean) / std
+
+    loader = torch.utils.data.DataLoader(
+        dataset, batch_size=batch_size, shuffle=False, num_workers=0,
     )
-    val_aus = AUSynthDataset(
-        aus_root, transform=val_transforms, split="val",
-        auto_generate=False,
+
+    for m in models:
+        m.eval()
+
+    n_models = len(models)
+    totals           = [0] * n_models
+    correct_targets  = [0] * n_models
+    orig_correct     = [0] * n_models
+
+    with torch.no_grad():
+        for imgs, labels in loader:
+            imgs, labels = imgs.to(device), labels.to(device)
+            B = imgs.size(0)
+
+            for mi, m in enumerate(models):
+                orig_correct[mi] += (m(imgs).argmax(1) == labels).sum().item()
+
+                eot_votes = torch.zeros(B, dtype=torch.long, device=device)
+                for _ in range(n_eot):
+                    cx = random.uniform(cx_min, cx_max)
+                    cy = random.uniform(cy_min, cy_max)
+                    patched     = apply_patch(imgs, patch_norm, cx_frac=cx, cy_frac=cy,
+                                              randomise_placement=False,
+                                              target_patch_px=target_patch_px)
+                    patched_01  = patched * std + mean
+                    patched_01  = eot_batch(patched_01, oblique=oblique_eot)
+                    patched_eot = (patched_01 - mean) / std
+                    preds       = m(patched_eot).argmax(1)
+                    eot_votes  += (preds == target_label).long()
+
+                correct_targets[mi] += (eot_votes >= (n_eot // 2 + 1)).sum().item()
+                totals[mi]          += B
+
+    print(f"\n── Patch Evaluation (EOT + random placement) ──")
+    arch_names = [getattr(m, '_arch_name', f'model_{i}') for i, m in enumerate(models)]
+    for mi, name in enumerate(arch_names):
+        T = totals[mi]
+        print(f"  [{name:22s}]  clean={orig_correct[mi]/T:.2%}  "
+              f"ASR={correct_targets[mi]/T:.2%}")
+
+    worst_asr = min(correct_targets[mi] / totals[mi] for mi in range(n_models))
+    print(f"  Worst-case (ensemble) ASR : {worst_asr:.2%}  "
+          f"(target={ALL_SPEEDS[target_label]} km/h, majority vote {n_eot} EOT)")
+
+
+# ── main ──────────────────────────────────────────────────────────────────────
+
+def _load_or_build(model_path: str, arch: str, pretrain_path: str, device) -> torch.nn.Module:
+    if Path(model_path).exists():
+        m = load_model(model_path, arch=arch).to(device)
+        print(f"  Loaded {arch} from {model_path}")
+    else:
+        print(f"  No checkpoint at {model_path} — building from pretrain")
+        m = build_surrogate(arch=arch, pretrain_path=pretrain_path).to(device)
+    m._arch_name = arch
+    return m
+
+
+def main(args):
+    device = get_device()
+    print(f"Device: {device}")
+
+    # Build ensemble — one surrogate per requested arch.
+    # --arch accepts a comma-separated list, e.g. "resnet18,mobilenet_v3_small"
+    arch_list = [a.strip() for a in args.arch.split(",")]
+    ensemble = []
+    for arch in arch_list:
+        # Each arch gets its own checkpoint file derived from --model, e.g.
+        # surrogate_mobilenet_v3_small.pt alongside surrogate.pt.
+        stem   = Path(args.model).stem
+        suffix = Path(args.model).suffix
+        arch_path = str(Path(args.model).parent / f"{stem}_{arch}{suffix}") \
+                    if arch != arch_list[0] else args.model
+        ensemble.append(_load_or_build(arch_path, arch, args.pretrain_path, device))
+
+    print(f"Ensemble: {[m._arch_name for m in ensemble]}")
+
+    fake_quant_schedule = None
+    if not args.no_fake_quant:
+        bits_choices = tuple(int(b) for b in args.fake_quant_bits.split(","))
+        fake_quant_schedule = FakeQuantSchedule(enabled=False)  # off until warmup elapses
+        print(f"Fake-quant EOT : bits={bits_choices}  p={args.fake_quant_p}  "
+              f"warmup={args.fake_quant_warmup} steps  "
+              f"(per-layer, per-forward — hooks stay live through eval too)")
+        for m in ensemble:
+            handles, _ = install_fake_quant_hooks(
+                m, bits_choices=bits_choices, p_apply=args.fake_quant_p,
+                schedule=fake_quant_schedule,
+            )
+            print(f"  {m._arch_name}: hooked {len(handles)} Conv2d/Linear layers")
+
+    from torch.utils.data import ConcatDataset
+    gtsrb_val = FilteredGTSRB(args.data, split="test", transform=val_transforms, download=False)
+    aus_val   = AUSynthDataset(args.aus_data, transform=val_transforms, split="val", auto_generate=False)
+    val_ds    = ConcatDataset([gtsrb_val, aus_val])
+    print(f"Val samples: {len(val_ds)}  (GTSRB={len(gtsrb_val)}, AU synth={len(aus_val)})")
+
+    target_label = KMH_TO_LABEL[args.target]
+    print(f"Target: {args.target} km/h  (label {target_label})")
+
+    patch_01, target_patch_px = optimise_patch(
+        models       = ensemble,
+        dataset      = val_ds,
+        target_label = target_label,
+        patch_size   = args.patch_size,
+        steps        = args.steps,
+        lr           = args.lr,
+        eot_samples  = args.eot_samples,
+        batch_size   = args.batch,
+        device       = device,
+        universal    = args.universal,
+        print_cm     = args.print_cm,
+        nps_weight   = args.nps_weight,
+        tv_weight    = args.tv_weight,
+        cx_min       = args.cx_min,
+        cx_max       = args.cx_max,
+        cy_min       = args.cy_min,
+        cy_max       = args.cy_max,
+        fake_quant_schedule = fake_quant_schedule,
+        fake_quant_warmup   = args.fake_quant_warmup,
+        loss_fn             = args.loss,
+        cw_margin           = args.margin,
+        oblique_eot         = args.oblique_eot,
     )
 
-    train_ds = ConcatDataset([train_gtsrb, train_aus])
-    val_ds   = ConcatDataset([val_gtsrb,   val_aus])
+    torch.save(patch_01, args.out)
+    print(f"Patch tensor saved: {args.out}")
 
-    # build balanced sampler over the merged training set
-    gtsrb_labels = [
-        KMH_TO_LABEL[GTSRB_ID_TO_KMH[train_gtsrb.base._samples[i][1]]]  # noqa: SLF001
-        for i in train_gtsrb.indices
-    ]
-    aus_labels = [label for _, label in train_aus.samples]
-    all_labels = gtsrb_labels + aus_labels
+    png_path = Path(args.out).with_suffix(".png")
+    save_patch_png(patch_01.cpu(), str(png_path), print_cm=args.print_cm)
 
-    class_counts   = np.bincount(all_labels, minlength=NUM_CLASSES).astype(float)
-    class_counts    = np.where(class_counts == 0, 1, class_counts)  # avoid /0
-    sample_weights = [1.0 / class_counts[l] for l in all_labels]
-    sampler = WeightedRandomSampler(sample_weights, num_samples=len(train_ds), replacement=True)
+    evaluate_patch(ensemble, val_ds, patch_01, target_label,
+                   target_patch_px=target_patch_px, device=device, n_eot=args.eot_samples,
+                   cx_min=args.cx_min, cx_max=args.cx_max,
+                   cy_min=args.cy_min, cy_max=args.cy_max,
+                   oblique_eot=args.oblique_eot)
 
-    train_loader = DataLoader(
-        train_ds, batch_size=batch_size, sampler=sampler,
-        num_workers=num_workers, pin_memory=True,
-    )
-    val_loader = DataLoader(
-        val_ds, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=True,
-    )
-    return train_loader, val_loader
+
+if __name__ == "__main__":
+    p = argparse.ArgumentParser()
+    p.add_argument("--model",         default="surrogate.pt")
+    p.add_argument("--pretrain-path", default="./gtsrb_backbone.pt")
+    p.add_argument("--arch",          default="resnet18",
+                   help=f"Comma-separated list of architectures for ensemble. "
+                        f"Choices: {','.join(ARCH_CHOICES)}")
+    p.add_argument("--data",          default="./data")
+    p.add_argument("--aus-data",      default="./data/aus_synth")
+    p.add_argument("--out",           default="patch.pt")
+    p.add_argument("--universal",     action="store_true", default=True)
+    p.add_argument("--target",        type=int,   default=80,   help="Target km/h class")
+    p.add_argument("--patch-size",    type=int,   default=945,  help="Patch pixel size (print res)")
+    p.add_argument("--steps",         type=int,   default=2000)
+    p.add_argument("--lr",            type=float, default=0.01)
+    p.add_argument("--eot-samples",   type=int,   default=16)
+    p.add_argument("--batch",         type=int,   default=32)
+    p.add_argument("--print-cm",      type=float, default=8.0,  help="Printed patch size in cm")
+    p.add_argument("--nps-weight",    type=float, default=0.01, help="Printability loss weight (0 to disable)")
+    p.add_argument("--tv-weight",     type=float, default=0.05, help="Total variation loss weight (0 to disable)")
+    # Model-side quantisation EOT — hooks each surrogate's Conv2d/Linear layers
+    # so the optimiser sees int-N activation rounding, approximating an
+    # embedded NPU without needing the real target's weights/calibration.
+    p.add_argument("--loss",          default="ce", choices=["ce", "margin"],
+                   help="Loss function: 'ce' (cross-entropy) or 'margin' (CW-style margin loss)")
+    p.add_argument("--margin",        type=float, default=10.0,
+                   help="Margin for CW-style loss (logit gap target must exceed runner-up by)")
+    p.add_argument("--no-fake-quant", action="store_true", default=False,
+                   help="Disable fake-quant activation hooks (enabled by default)")
+    p.add_argument("--fake-quant-bits", default="6,8",
+                   help="Comma-separated bit-widths to sample per layer per forward")
+    p.add_argument("--fake-quant-p",  type=float, default=0.3,
+                   help="Probability a given layer is fake-quantised on a given forward")
+    p.add_argument("--fake-quant-warmup", type=int, default=200,
+                   help="Steps of clean (unquantised) optimisation before enabling the hooks")
+    # Placement range — train only over the off-centre region where the patch
+    # will physically appear.  Defaults cover +60mm right / ±10mm vertical
+    # with ±25mm human placement error.  cx/cy are fractions of image width/height
+    # (0.5 = sign centre; 0.75 ≈ +60mm right on a 190mm sign at 224px input).
+    p.add_argument("--cx-min",        type=float, default=0.62,
+                   help="Min patch centre X fraction (0=left edge, 0.5=sign centre)")
+    p.add_argument("--cx-max",        type=float, default=0.84,
+                   help="Max patch centre X fraction")
+    p.add_argument("--oblique-eot",   action="store_true", default=False,
+                   help="Enable oblique (off-axis 45-80°) perspective transforms in EOT")
+    p.add_argument("--cy-min",        type=float, default=0.35,
+                   help="Min patch centre Y fraction (0=top, 0.5=sign centre)")
+    p.add_argument("--cy-max",        type=float, default=0.58,
+                   help="Max patch centre Y fraction")
+    main(p.parse_args())
