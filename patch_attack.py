@@ -48,6 +48,23 @@ def denormalize(t: torch.Tensor) -> torch.Tensor:
 
 # ── patch application (rectangular — no mask) ────────────────────────────────
 
+def make_patch_mask(
+    B: int, H: int, W: int, P: int,
+    cx_frac: float, cy_frac: float,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Create a binary mask (B, 1, H, W) with 1.0 where the patch sits.
+    Used to tell eot_scene which pixels are matte-printed patch vs
+    retroreflective sign background — for differential retroreflection.
+    """
+    mask = torch.zeros(B, 1, H, W, device=device)
+    top  = max(0, min(int(cy_frac * H - P / 2), H - P))
+    left = max(0, min(int(cx_frac * W - P / 2), W - P))
+    mask[:, :, top:top + P, left:left + P] = 1.0
+    return mask
+
+
 def apply_patch(
     images: torch.Tensor,          # (B, 3, H, W)  normalised
     patch_norm: torch.Tensor,      # (1, 3, P, P)  normalised patch — may be print-res
@@ -294,10 +311,15 @@ def optimise_patch(
             patched     = apply_patch(imgs, patch_norm_eot, cx_frac=cx, cy_frac=cy,
                                       randomise_placement=False,
                                       target_patch_px=target_patch_px)
+            # Build patch mask for differential retroreflection — tells
+            # eot_scene which pixels are matte patch vs retroreflective sign.
+            p_mask = make_patch_mask(B, IMG_SIZE, IMG_SIZE, target_patch_px,
+                                    cx, cy, device)
             # Scene EOT on the composited image — geometry, lighting, camera,
             # sensor all happen to the sign+patch together in the real world.
             patched_01  = patched * std + mean
-            patched_01  = eot_scene(patched_01.clone(), oblique=oblique_eot)
+            patched_01  = eot_scene(patched_01.clone(), oblique=oblique_eot,
+                                    patch_mask=p_mask)
             patched_eot = (patched_01 - mean) / std
 
             logits = surrogate(patched_eot)
@@ -336,8 +358,12 @@ def optimise_patch(
                                               cx_frac=cx_log, cy_frac=cy_log,
                                               randomise_placement=False,
                                               target_patch_px=target_patch_px)
+                p_mask_log      = make_patch_mask(B, IMG_SIZE, IMG_SIZE,
+                                                  target_patch_px, cx_log, cy_log,
+                                                  device)
                 patched_01_log  = patched_log * std + mean
-                patched_01_log  = eot_scene(patched_01_log, oblique=oblique_eot)
+                patched_01_log  = eot_scene(patched_01_log, oblique=oblique_eot,
+                                            patch_mask=p_mask_log)
                 patched_eot_log = (patched_01_log - mean) / std
                 # Report ASR as the worst-case (minimum) across all surrogates
                 asr = min(
@@ -425,8 +451,11 @@ def evaluate_patch(
                     patched     = apply_patch(imgs, patch_norm_ev, cx_frac=cx, cy_frac=cy,
                                               randomise_placement=False,
                                               target_patch_px=target_patch_px)
+                    p_mask_ev   = make_patch_mask(B, IMG_SIZE, IMG_SIZE,
+                                                  target_patch_px, cx, cy, device)
                     patched_01  = patched * std + mean
-                    patched_01  = eot_scene(patched_01, oblique=oblique_eot)
+                    patched_01  = eot_scene(patched_01, oblique=oblique_eot,
+                                            patch_mask=p_mask_ev)
                     patched_eot = (patched_01 - mean) / std
                     preds       = m(patched_eot).argmax(1)
                     eot_votes  += (preds == target_label).long()
@@ -564,7 +593,7 @@ if __name__ == "__main__":
     # embedded NPU without needing the real target's weights/calibration.
     p.add_argument("--loss",          default="ce", choices=["ce", "margin"],
                    help="Loss function: 'ce' (cross-entropy) or 'margin' (CW-style margin loss)")
-    p.add_argument("--margin",        type=float, default=10.0,
+    p.add_argument("--margin",        type=float, default=5.0,
                    help="Margin for CW-style loss (logit gap target must exceed runner-up by)")
     p.add_argument("--no-fake-quant", action="store_true", default=False,
                    help="Disable fake-quant activation hooks (enabled by default)")
