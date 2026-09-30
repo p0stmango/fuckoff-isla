@@ -558,11 +558,27 @@ CAMERA_TRANSFORMS = [
 ]
 
 
-def eot_batch(x: torch.Tensor, n_transforms: int = 3,
+def eot_print(x: torch.Tensor) -> torch.Tensor:
+    """
+    Print-only EOT transforms — gamut, CMYK, dot gain, banding, paper texture,
+    and mounting curl.  Applied to the PATCH ONLY, before compositing onto the
+    sign image.  The physical sign is retroreflective aluminium — it never
+    passes through a printer.
+    """
+    x = random.choice(PRINT_TRANSFORMS)(x)
+    if random.random() < 0.6:
+        x = apply_paper_curl(x)
+    return torch.clamp(x, 0.0, 1.0)
+
+
+def eot_scene(x: torch.Tensor, n_transforms: int = 3,
               oblique: bool = False) -> torch.Tensor:
     """
-    Apply transforms sampled from each physical stage in order.
-    Physical causal chain: print → mount → geometry → lighting → camera → sensor.
+    Scene-level EOT transforms — applied to the composited image (sign + patch
+    together) because these happen in the physical world / camera, not the
+    printer.
+
+    Physical causal chain: geometry → lighting → camera → sensor.
 
     oblique: if True, mix in extreme off-axis perspective transforms (~40% of
     the time) to simulate the camera passing a roadside sign close to the
@@ -570,13 +586,6 @@ def eot_batch(x: torch.Tensor, n_transforms: int = 3,
     nearly edge-on — heavy horizontal foreshortening + convergence that the
     standard approach_left/right scenarios don't cover.
     """
-    # ── print artifacts (always one) ──────────────────────────────────────
-    x = random.choice(PRINT_TRANSFORMS)(x)
-
-    # ── mount curl (60% chance) ───────────────────────────────────────────
-    if random.random() < 0.6:
-        x = apply_paper_curl(x)
-
     # ── geometry (always all three, in order) ─────────────────────────────
     if oblique and random.random() < 0.4:
         x = apply_oblique_perspective(x)
@@ -607,3 +616,15 @@ def eot_batch(x: torch.Tensor, n_transforms: int = 3,
         x = apply_clahe(x)
 
     return torch.clamp(x, 0.0, 1.0)
+
+
+def eot_batch(x: torch.Tensor, n_transforms: int = 3,
+              oblique: bool = False) -> torch.Tensor:
+    """
+    Legacy combined EOT — applies ALL transforms (print + scene) to the
+    full image.  Kept for backward compatibility with evaluation code.
+    For training, use eot_print() on the patch and eot_scene() on the
+    composited image separately.
+    """
+    x = eot_print(x)
+    return eot_scene(x, n_transforms=n_transforms, oblique=oblique)
