@@ -593,8 +593,17 @@ def eot_batch(x: torch.Tensor, n_transforms: int = 3,
     for fn in random.sample(CAMERA_TRANSFORMS, k=min(n_cam, len(CAMERA_TRANSFORMS))):
         x = fn(x)
 
-    # ── sensor: grayscale then CLAHE (always last) ────────────────────────
-    x = apply_grayscale(x)
-    x = apply_clahe(x)
+    # ── sensor: grayscale + CLAHE (50% of EOT samples) ─────────────────
+    # The target's monochrome sensor always sees grayscale+CLAHE, but the
+    # surrogates were trained on ~50% colour / ~50% grayscale (dataset.py
+    # RandomGrayscale p=0.5).  Gating to 50% keeps the gradient signal
+    # alive through colour features the surrogates actually learned, while
+    # still forcing the patch to survive the grayscale+CLAHE path half the
+    # time.  Without gating, 100% of gradient updates come through the
+    # CLAHE STE, which is a systematically wrong approximation — the
+    # optimizer doesn't know CLAHE's actual local effect on each pixel.
+    if random.random() < 0.5:
+        x = apply_grayscale(x)
+        x = apply_clahe(x)
 
     return torch.clamp(x, 0.0, 1.0)
