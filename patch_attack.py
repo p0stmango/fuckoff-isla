@@ -201,6 +201,7 @@ def optimise_patch(
     fake_quant_warmup: int = 200,
     loss_fn:      str   = "ce",    # "ce" | "margin"
     cw_margin:    float = 10.0,
+    oblique_eot:  bool  = False,
 ) -> torch.Tensor:
     """
     patch_size is the PRINT resolution of the patch (e.g. 945 = 8cm @ 300 DPI).
@@ -288,7 +289,7 @@ def optimise_patch(
                                       randomise_placement=False,
                                       target_patch_px=target_patch_px)
             patched_01  = patched * std + mean
-            patched_01  = eot_batch(patched_01.clone())
+            patched_01  = eot_batch(patched_01.clone(), oblique=oblique_eot)
             patched_eot = (patched_01 - mean) / std
 
             logits = surrogate(patched_eot)
@@ -327,7 +328,7 @@ def optimise_patch(
                                               randomise_placement=False,
                                               target_patch_px=target_patch_px)
                 patched_01_log  = patched_log * std + mean
-                patched_01_log  = eot_batch(patched_01_log)
+                patched_01_log  = eot_batch(patched_01_log, oblique=oblique_eot)
                 patched_eot_log = (patched_01_log - mean) / std
                 # Report ASR as the worst-case (minimum) across all surrogates
                 asr = min(
@@ -372,6 +373,7 @@ def evaluate_patch(
     cx_max:          float = 0.84,
     cy_min:          float = 0.35,
     cy_max:          float = 0.58,
+    oblique_eot:     bool  = False,
 ):
     """
     Evaluate ASR independently on each surrogate so you can see per-arch
@@ -412,7 +414,7 @@ def evaluate_patch(
                                               randomise_placement=False,
                                               target_patch_px=target_patch_px)
                     patched_01  = patched * std + mean
-                    patched_01  = eot_batch(patched_01)
+                    patched_01  = eot_batch(patched_01, oblique=oblique_eot)
                     patched_eot = (patched_01 - mean) / std
                     preds       = m(patched_eot).argmax(1)
                     eot_votes  += (preds == target_label).long()
@@ -509,6 +511,7 @@ def main(args):
         fake_quant_warmup   = args.fake_quant_warmup,
         loss_fn             = args.loss,
         cw_margin           = args.margin,
+        oblique_eot         = args.oblique_eot,
     )
 
     torch.save(patch_01, args.out)
@@ -520,7 +523,8 @@ def main(args):
     evaluate_patch(ensemble, val_ds, patch_01, target_label,
                    target_patch_px=target_patch_px, device=device, n_eot=args.eot_samples,
                    cx_min=args.cx_min, cx_max=args.cx_max,
-                   cy_min=args.cy_min, cy_max=args.cy_max)
+                   cy_min=args.cy_min, cy_max=args.cy_max,
+                   oblique_eot=args.oblique_eot)
 
 
 if __name__ == "__main__":
@@ -566,6 +570,8 @@ if __name__ == "__main__":
                    help="Min patch centre X fraction (0=left edge, 0.5=sign centre)")
     p.add_argument("--cx-max",        type=float, default=0.84,
                    help="Max patch centre X fraction")
+    p.add_argument("--oblique-eot",   action="store_true", default=False,
+                   help="Enable oblique (off-axis 45-80°) perspective transforms in EOT")
     p.add_argument("--cy-min",        type=float, default=0.35,
                    help="Min patch centre Y fraction (0=top, 0.5=sign centre)")
     p.add_argument("--cy-max",        type=float, default=0.58,
