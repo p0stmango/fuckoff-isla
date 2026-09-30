@@ -372,7 +372,7 @@ def apply_sensor_noise(x: torch.Tensor) -> torch.Tensor:
 
 def apply_scale_jitter(x: torch.Tensor) -> torch.Tensor:
     B, C, H, W = x.shape
-    scale = _rand(0.65, 1.20)
+    scale = _rand(0.80, 1.15)
     if abs(scale - 1.0) < 0.03:
         return x
     new_h = max(16, int(H * scale))
@@ -557,37 +557,23 @@ def _fake_quant_hook(bits_choices, p_apply, schedule):
             return out
         bits = random.choice(bits_choices)
 
-        # ── Symmetric per-tensor quantisation ──────────────────────────
-        # EyeQ4's fixed-function NPU (2018-era ASIC, ~2.5 TOPS @ 3W)
-        # uses symmetric per-tensor INT8 — the simplest hardware scheme
-        # that doesn't need per-channel scale factors.
+        # ── Activation-only fake-quant (STE) ─────────────────────────
+        # We quantise activations only during training.  Weight quantisation
+        # during training had a broken STE: the gradient flowed through `out`
+        # (computed with float weights) but the forward used `out_dq` (from
+        # quantised weights), so the gradient didn't match the forward path.
         #
-        # We fake-quant BOTH weights and activations to match real INT8
-        # inference, where the matmul/conv operates on quantised weights
-        # and quantised input activations.
-
-        # ── Weight fake-quant (STE) ──────────────────────────────────
-        # Quantise the layer's weight in-place for this forward pass,
-        # then restore after.  STE: gradients pass through as if the
-        # weight wasn't quantised (they flow to the patch, not the weight).
-        w = module.weight
-        w_dq, _ = _sym_fake_quant(w, bits)
-        w_orig = w.data.clone()
-        w.data = w_dq
-        # Re-run the layer with quantised weights to get the correct output
-        if isinstance(module, nn.Conv2d):
-            out_wq = F.conv2d(inp[0], w.data, module.bias, module.stride,
-                              module.padding, module.dilation, module.groups)
-        elif isinstance(module, nn.Linear):
-            out_wq = F.linear(inp[0], w.data, module.bias)
-        else:
-            out_wq = out  # fallback — shouldn't happen
-        # Restore original weights immediately
-        w.data = w_orig
-
-        # ── Activation fake-quant (STE) ──────────────────────────────
-        out_dq, _ = _sym_fake_quant(out_wq, bits)
-        # Straight-through: forward = dq, backward = identity w.r.t. out.
+        # Activation-only quant is sufficient because:
+        #   1. The surrogates' weights are frozen during patch optimisation —
+        #      gradients flow to the patch tensor, not the weights.
+        #   2. The activation bottleneck is what matters for transfer: the patch
+        #      must produce activations that survive INT8 rounding.
+        #   3. Weight quant still runs in the deterministic eval hooks (p=1.0,
+        #      no backward needed) so qASR correctly reflects both W+A quant.
+        #
+        # EyeQ4 uses symmetric per-tensor INT8 — the simplest hardware scheme.
+        out_dq, _ = _sym_fake_quant(out, bits)
+        # Straight-through: forward = quantised, backward = identity w.r.t. out.
         return out + (out_dq - out.detach())
     return hook
 
@@ -696,7 +682,8 @@ def eot_print(x: torch.Tensor) -> torch.Tensor:
 
 def eot_scene(x: torch.Tensor, n_transforms: int = 3,
               oblique: bool = False,
-              patch_mask: torch.Tensor = None) -> torch.Tensor:
+              patch_mask: torch.Tensor = None,
+              training_step: int = None) -> torch.Tensor:
     """
     Scene-level EOT transforms — applied to the composited image (sign + patch
     together) because these happen in the physical world / camera, not the
@@ -714,6 +701,11 @@ def eot_scene(x: torch.Tensor, n_transforms: int = 3,
     sign background.  When provided, the mask is warped through the same
     geometry transforms so differential retroreflection can distinguish
     the retroreflective sign background from the matte printed patch.
+
+    training_step: current optimisation step (None = eval / always apply).
+    When set and < 500, the grayscale+CLAHE sensor path is skipped to let
+    the patch converge on colour features first before hardening against
+    the monochrome ISP pipeline.
     """
     has_mask = patch_mask is not None
 
@@ -764,11 +756,24 @@ def eot_scene(x: torch.Tensor, n_transforms: int = 3,
     # time.  Without gating, 100% of gradient updates come through the
     # CLAHE STE, which is a systematically wrong approximation — the
     # optimizer doesn't know CLAHE's actual local effect on each pixel.
-    if random.random() < 0.5:
+    #
+    # During early training (step < 500), skip grayscale+CLAHE entirely so
+    # the patch converges using richer colour gradients first.  The CLAHE
+    # STE is a coarse approximation that adds gradient noise — deferring it
+    # lets the optimiser find a good basin before hardening.
+    _apply_sensor = (training_step is None or training_step >= 500)
+    if _apply_sensor and random.random() < 0.5:
         x = apply_grayscale(x)
         x = apply_clahe(x)
 
-    return torch.clamp(x, 0.0, 1.0)
+    # STE clamp: forward value is clamped to [0,1] (correct for the model),
+    # but backward gradient passes through unchanged so pixels at saturation
+    # boundaries still get useful gradients.  This fixes the gradient death
+    # from the denormalise → eot_scene(clamp) → renormalise round-trip in
+    # patch_attack.py — without this, any pixel pushed to 0 or 1 by the
+    # lighting/camera transforms has zero gradient back to the patch.
+    clamped = torch.clamp(x, 0.0, 1.0)
+    return x + (clamped - x).detach()      # forward=clamped, backward=identity
 
 
 def eot_batch(x: torch.Tensor, n_transforms: int = 3,
