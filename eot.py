@@ -26,6 +26,25 @@ def _rand(lo: float, hi: float) -> float:
     return random.uniform(lo, hi)
 
 
+def _ste_clamp_01(x: torch.Tensor) -> torch.Tensor:
+    """
+    Straight-through-estimator clamp to [0, 1].
+
+    Forward:  value is hard-clamped (correct physics — no negative light,
+              no values above sensor saturation).
+    Backward: gradient passes through as identity, so the optimiser still
+              gets a useful signal for pixels pushed into saturation by
+              brightness, gamma, spotlight, etc.
+
+    Without this, every torch.clamp(x, 0, 1) on the gradient path is a
+    hard gate that zeros gradients for saturated pixels.  With 10+ clamps
+    chained through the EOT pipeline, the probability of ANY given pixel
+    surviving with nonzero gradient drops multiplicatively.
+    """
+    clamped = torch.clamp(x, 0.0, 1.0)
+    return x + (clamped - x).detach()
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # GROUP 1 — PRINT ARTIFACTS
 # ════════════════════════════════════════════════════════════════════════════
@@ -35,7 +54,7 @@ def apply_gamut_compression(x: torch.Tensor) -> torch.Tensor:
     offsets = torch.tensor([0.04, 0.02, 0.02], device=x.device).view(1, 3, 1, 1)
     factors = factors + torch.randn_like(factors) * 0.03
     x = x * factors + offsets
-    return torch.clamp(x, 0.0, 1.0)
+    return _ste_clamp_01(x)
 
 
 def apply_cmyk_roundtrip(x: torch.Tensor) -> torch.Tensor:
@@ -45,16 +64,16 @@ def apply_cmyk_roundtrip(x: torch.Tensor) -> torch.Tensor:
     k = torch.min(torch.cat([c, m, y], dim=1), dim=1, keepdim=True).values
     k_amount = _rand(0.05, 0.20)
     k = k * k_amount
-    r = torch.clamp(1.0 - c - k, 0, 1)
-    g = torch.clamp(1.0 - m - k, 0, 1)
-    b = torch.clamp(1.0 - y - k, 0, 1)
+    r = _ste_clamp_01(1.0 - c - k)
+    g = _ste_clamp_01(1.0 - m - k)
+    b = _ste_clamp_01(1.0 - y - k)
     return torch.cat([r, g, b], dim=1)
 
 
 def apply_dot_gain(x: torch.Tensor) -> torch.Tensor:
     gain = _rand(0.08, 0.22)
     x = x - gain * 4.0 * x * (1.0 - x)
-    return torch.clamp(x, 0.0, 1.0)
+    return _ste_clamp_01(x)
 
 
 def apply_channel_misregistration(x: torch.Tensor) -> torch.Tensor:
@@ -77,7 +96,7 @@ def apply_print_banding(x: torch.Tensor) -> torch.Tensor:
     rows    = torch.arange(H, device=x.device, dtype=x.dtype)
     banding = 1.0 + band_amp * torch.sin(2 * math.pi * rows / band_period)
     banding = banding.view(1, 1, H, 1).expand(B, C, H, W)
-    return torch.clamp(x * banding, 0.0, 1.0)
+    return _ste_clamp_01(x * banding)
 
 
 def apply_paper_texture(x: torch.Tensor) -> torch.Tensor:
@@ -85,7 +104,7 @@ def apply_paper_texture(x: torch.Tensor) -> torch.Tensor:
     texture = 1.0 + torch.randn_like(x) * texture_std
     weight  = x.detach().mean(dim=1, keepdim=True).expand_as(x)
     combined = 1.0 + (texture - 1.0) * weight
-    return torch.clamp(x * combined, 0.0, 1.0)
+    return _ste_clamp_01(x * combined)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -254,9 +273,9 @@ def _four_point_to_grid(src, dst, H, W, device):
 def apply_brightness_gamma(x: torch.Tensor) -> torch.Tensor:
     brightness = _rand(0.45, 1.55)
     gamma      = _rand(0.55, 1.65)
-    x = torch.clamp(x * brightness, 0.0, 1.0)
+    x = _ste_clamp_01(x * brightness)
     x = torch.pow(x + 1e-8, gamma)
-    return torch.clamp(x, 0.0, 1.0)
+    return _ste_clamp_01(x)
 
 
 def apply_spotlight(x: torch.Tensor) -> torch.Tensor:
@@ -267,7 +286,7 @@ def apply_spotlight(x: torch.Tensor) -> torch.Tensor:
     gx = torch.arange(W, device=x.device, dtype=x.dtype).view(1, W).expand(H, W)
     dist2 = (gx - cx) ** 2 + (gy - cy) ** 2
     light = (0.25 + 1.3 * torch.exp(-dist2 / (2 * sigma ** 2))).view(1, 1, H, W).expand(B, C, H, W)
-    return torch.clamp(x * light, 0.0, 1.0)
+    return _ste_clamp_01(x * light)
 
 
 def apply_retroreflection(x: torch.Tensor) -> torch.Tensor:
@@ -280,7 +299,7 @@ def apply_retroreflection(x: torch.Tensor) -> torch.Tensor:
     dist2 = (gx - W/2.0)**2 + (gy - H/2.0)**2
     retro = (0.1 + 2.2 * torch.exp(-dist2 / (2 * sigma**2))).view(1, 1, H, W).expand(B, C, H, W)
     light = 1.0 + strength * (retro - 1.0)
-    return torch.clamp(x * light, 0.0, 1.0)
+    return _ste_clamp_01(x * light)
 
 
 def apply_differential_retroreflection(x: torch.Tensor,
@@ -307,7 +326,7 @@ def apply_differential_retroreflection(x: torch.Tensor,
     # Only the sign background (non-patch) gets the retroreflective boost
     sign_mask = 1.0 - patch_mask                       # (B, 1, H, W)
     x = x * (1.0 + boost * sign_mask)
-    return torch.clamp(x, 0.0, 1.0)
+    return _ste_clamp_01(x)
 
 
 def apply_auto_exposure(x: torch.Tensor) -> torch.Tensor:
@@ -329,14 +348,14 @@ def apply_auto_exposure(x: torch.Tensor) -> torch.Tensor:
     compressed = knee + excess * ratio * torch.tanh(excess / (0.1 + excess * 0.5))
     below = torch.min(x, torch.tensor(knee, device=x.device))
     x = below + compressed
-    return torch.clamp(x, 0.0, 1.0)
+    return _ste_clamp_01(x)
 
 
 def apply_colour_temperature(x: torch.Tensor) -> torch.Tensor:
     shift = _rand(-0.06, 0.08)
     tint  = torch.tensor([shift, shift * 0.3, -shift * 0.8],
                          device=x.device).view(1, 3, 1, 1)
-    return torch.clamp(x + tint, 0.0, 1.0)
+    return _ste_clamp_01(x + tint)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -367,7 +386,7 @@ def apply_defocus_blur(x: torch.Tensor) -> torch.Tensor:
 
 def apply_sensor_noise(x: torch.Tensor) -> torch.Tensor:
     std = _rand(0.0, 0.05)
-    return torch.clamp(x + torch.randn_like(x) * std, 0.0, 1.0)
+    return _ste_clamp_01(x + torch.randn_like(x) * std)
 
 
 def apply_scale_jitter(x: torch.Tensor) -> torch.Tensor:
@@ -388,7 +407,7 @@ def apply_scale_jitter(x: torch.Tensor) -> torch.Tensor:
         top  = (new_h - H) // 2
         left = (new_w - W) // 2
         out  = resized[:, :, top:top + H, left:left + W]
-    return out.clamp(0.0, 1.0)
+    return _ste_clamp_01(out)
 
 
 def apply_crop_jitter(x: torch.Tensor) -> torch.Tensor:
@@ -413,14 +432,14 @@ def apply_windscreen_tint(x: torch.Tensor) -> torch.Tensor:
          tint_strength * 0.2,
         -tint_strength * 0.1,
     ], device=x.device).view(1, 3, 1, 1)
-    x = torch.clamp(x + tint, 0.0, 1.0)
+    x = _ste_clamp_01(x + tint)
     if random.random() < 0.4:
         shift = random.choice([1, 2])
         out = x.clone()
         out[:, 0] = torch.roll(x[:, 0], shifts=shift,  dims=-1)
         out[:, 2] = torch.roll(x[:, 2], shifts=-shift, dims=-1)
         x = out
-    return torch.clamp(x, 0.0, 1.0)
+    return _ste_clamp_01(x)
 
 
 def apply_jpeg_compression(x: torch.Tensor) -> torch.Tensor:
@@ -436,7 +455,7 @@ def apply_jpeg_compression(x: torch.Tensor) -> torch.Tensor:
     blocks = blocks + noise
     out = blocks.contiguous().view(B, C, Hp // block, Wp // block, block, block)
     out = out.permute(0, 1, 2, 4, 3, 5).contiguous().view(B, C, Hp, Wp)
-    return torch.clamp(out[:, :, :H, :W], 0.0, 1.0)
+    return _ste_clamp_01(out[:, :, :H, :W])
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -677,7 +696,7 @@ def eot_print(x: torch.Tensor) -> torch.Tensor:
         x = fn(x)
     if random.random() < 0.6:
         x = apply_paper_curl(x)
-    return torch.clamp(x, 0.0, 1.0)
+    return _ste_clamp_01(x)
 
 
 def eot_scene(x: torch.Tensor, n_transforms: int = 3,
