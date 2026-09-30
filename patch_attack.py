@@ -386,7 +386,7 @@ def optimise_patch(
             # sensor all happen to the sign+patch together in the real world.
             patched_01  = patched * std + mean
             patched_01  = eot_scene(patched_01.clone(), oblique=oblique_eot,
-                                    patch_mask=p_mask)
+                                    patch_mask=p_mask, training_step=step)
             patched_eot = (patched_01 - mean) / std
 
             logits = surrogate(patched_eot)
@@ -712,7 +712,9 @@ if __name__ == "__main__":
     p.add_argument("--patch-size",    type=int,   default=945,  help="Patch pixel size (print res)")
     p.add_argument("--steps",         type=int,   default=2000)
     p.add_argument("--lr",            type=float, default=0.01)
-    p.add_argument("--eot-samples",   type=int,   default=16)
+    p.add_argument("--eot-samples",   type=int,   default=8,
+                   help="EOT samples per step (lower = less gradient variance, faster convergence)")
+
     p.add_argument("--batch",         type=int,   default=32)
     p.add_argument("--print-cm",      type=float, default=8.0,  help="Printed patch size in cm")
     p.add_argument("--nps-weight",    type=float, default=0.01, help="Printability loss weight (0 to disable)")
