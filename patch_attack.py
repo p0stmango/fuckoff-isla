@@ -330,6 +330,9 @@ def optimise_patch(
     def to_normalised(p_01):
         return (p_01 - mean) / std
 
+    best_asr   = -1.0
+    best_patch = patch_01.detach().clone()
+
     pbar = tqdm(range(1, steps + 1), desc="Optimising patch")
     for step in pbar:
         if (fake_quant_schedule is not None and not fake_quant_schedule.enabled
@@ -492,10 +495,19 @@ def optimise_patch(
                     quant_asr = min(h / _per_model_total for h in _q_hits)
                     quant_asr_str = f"  qASR={quant_asr:.2%}"
 
+            # ── save best patch by min-ASR ────────────────────────────
+            if asr > best_asr:
+                best_asr   = asr
+                best_patch = patch_01.detach().clamp(0, 1).clone()
+                _best_step = step
+                _best_detail = per_model_str
+                pbar.write(f"[step {step}] ★ new best ASR={asr:.2%}  ({per_model_str})")
+
             if _fq_was_enabled:
                 fake_quant_schedule.enabled = True
             pbar.set_postfix(loss=f"{total_loss.item():.4f}",
                              ASR=f"{asr:.2%}{quant_asr_str}",
+                             best=f"{best_asr:.2%}",
                              detail=per_model_str)
 
             _inter_dir = Path("intermediate_examples")
@@ -503,7 +515,8 @@ def optimise_patch(
             arr = patch_01.detach().clamp(0, 1).squeeze(0).permute(1, 2, 0).cpu().numpy()
             Image.fromarray((arr * 255).astype(np.uint8)).save(_inter_dir / f"patch_step_{step:04d}.png")
 
-    return patch_01.detach().clamp(0, 1), target_patch_px
+    print(f"\nBest patch from step {_best_step}: ASR={best_asr:.2%}  ({_best_detail})")
+    return best_patch, target_patch_px
 
 
 # ── export ────────────────────────────────────────────────────────────────────
