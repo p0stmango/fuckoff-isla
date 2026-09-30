@@ -5,10 +5,13 @@ Crops the sign region from the printable (patch already composited),
 resizes to 224×224 via val_transforms, applies EOT, and reports per-model
 predictions. This is the closest digital proxy to "print → photograph → classify".
 
+Supports both targeted (ASR@80) and untargeted (any misclassification) modes.
+
 Usage:
-    python eval_printable.py                           # printable_sign.png, 32 EOT runs
-    python eval_printable.py --printable my_sign.png   # different file
-    python eval_printable.py --n-eot 64               # more samples for stable vote
+    python eval_printable.py                                      # default: untargeted
+    python eval_printable.py --loss untargeted                    # any misclassification = success
+    python eval_printable.py --loss targeted                      # only 80 km/h counts
+    python eval_printable.py --printable my_sign.png --n-eot 64
 """
 import argparse
 
@@ -35,7 +38,7 @@ _STD  = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
 
 SURROGATE_CONFIGS = {
     "resnet18":           ("surrogate.pt",                    "resnet18"),
-    "mobilenet_v3_small": ("surrogate_mobilenet_v3_small.pt", "mobilenet_v3_small"),
+    "mobilenet_v3_large": ("surrogate_mobilenet_v3_large.pt", "mobilenet_v3_large"),
     "efficientnet_b0":    ("surrogate_efficientnet_b0.pt",    "efficientnet_b0"),
 }
 
@@ -109,7 +112,9 @@ def main(args):
             print(f"  {name:<25}  {ALL_SPEEDS[pred]:>5} km/h")
 
     # ── EOT vote — simulates geometric/lighting/sensor variation ─────────────
+    true_label  = KMH_TO_LABEL[5]       # ground truth: 5 km/h sign
     target_pred = KMH_TO_LABEL[80]
+    untargeted  = (args.loss == "untargeted")
     votes = {name: [0] * len(ALL_SPEEDS) for name in models}
 
     with torch.no_grad():
@@ -122,19 +127,28 @@ def main(args):
             for name, m in models.items():
                 votes[name][m(t_eot).argmax(1).item()] += 1
 
-    print(f"\n── EOT vote ({args.n_eot} samples) — simulates print → photo pipeline ──")
-    print(f"  {'Model':<25}  {'Top pred':>9}  {'Conf':>6}  {'ASR@80':>7}")
-    print("  " + "─" * 54)
+    mode_str = "misclassify" if untargeted else "targeted@80"
+    print(f"\n── EOT vote ({args.n_eot} samples, {mode_str}) — simulates print → photo pipeline ──")
+    if untargeted:
+        print(f"  {'Model':<25}  {'Top pred':>9}  {'Conf':>6}  {'ASR(≠5)':>8}")
+    else:
+        print(f"  {'Model':<25}  {'Top pred':>9}  {'Conf':>6}  {'ASR@80':>7}")
+    print("  " + "─" * 56)
     worst_asr = 1.0
     for name, v in votes.items():
         best  = max(range(len(v)), key=lambda i: v[i])
         conf  = v[best] / args.n_eot
-        asr80 = v[target_pred] / args.n_eot
-        hit   = " ✓" if best == target_pred else ""
-        worst_asr = min(worst_asr, asr80)
-        print(f"  {name:<25}  {ALL_SPEEDS[best]:>5} km/h  {conf:>5.1%}  {asr80:>6.1%}{hit}")
+        if untargeted:
+            # any prediction that is NOT the true class counts as success
+            asr = 1.0 - (v[true_label] / args.n_eot)
+        else:
+            asr = v[target_pred] / args.n_eot
+        hit = " ✓" if (untargeted and best != true_label) or (not untargeted and best == target_pred) else ""
+        worst_asr = min(worst_asr, asr)
+        print(f"  {name:<25}  {ALL_SPEEDS[best]:>5} km/h  {conf:>5.1%}  {asr:>6.1%}{hit}")
 
-    print(f"  {'Ensemble worst-case ASR@80':<25}  {'':>9}  {'':>6}  {worst_asr:>6.1%}")
+    label = "Ensemble worst-case ASR(≠5)" if untargeted else "Ensemble worst-case ASR@80"
+    print(f"  {label:<25}  {'':>9}  {'':>6}  {worst_asr:>6.1%}")
     print(f"\nCheck eval_crop.png to confirm the patch is visible and centred in the crop.")
 
 
@@ -144,4 +158,8 @@ if __name__ == "__main__":
                    help="Output of make_printable.py")
     p.add_argument("--n-eot",     type=int, default=32,
                    help="Number of EOT samples for the vote")
+    p.add_argument("--loss",      default="untargeted",
+                   choices=["targeted", "untargeted"],
+                   help="'untargeted': any misclassification = success; "
+                        "'targeted': only 80 km/h counts")
     main(p.parse_args())
