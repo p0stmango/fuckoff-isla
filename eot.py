@@ -576,24 +576,42 @@ def _fake_quant_hook(bits_choices, p_apply, schedule):
             return out
         bits = random.choice(bits_choices)
 
-        # ── Activation-only fake-quant (STE) ─────────────────────────
-        # We quantise activations only during training.  Weight quantisation
-        # during training had a broken STE: the gradient flowed through `out`
-        # (computed with float weights) but the forward used `out_dq` (from
-        # quantised weights), so the gradient didn't match the forward path.
+        # ── Weight + Activation fake-quant (correct STE) ────────────
+        # Both weights AND activations are quantised, matching the eval
+        # hooks and real INT8 inference.
         #
-        # Activation-only quant is sufficient because:
-        #   1. The surrogates' weights are frozen during patch optimisation —
-        #      gradients flow to the patch tensor, not the weights.
-        #   2. The activation bottleneck is what matters for transfer: the patch
-        #      must produce activations that survive INT8 rounding.
-        #   3. Weight quant still runs in the deterministic eval hooks (p=1.0,
-        #      no backward needed) so qASR correctly reflects both W+A quant.
+        # The original activation-only approach was wrong: it optimised the
+        # patch against float-weight feature maps, but eval measured qASR
+        # with quantised weights — a completely different feature landscape.
+        # Result: qASR stuck at 0% because the patch never saw weight quant.
+        #
+        # Why the STE is correct now:
+        #   - _sym_fake_quant returns a detached tensor, so w_dq has no grad.
+        #   - F.conv2d(inp[0], w_dq, ...) computes the forward with quantised
+        #     weights.  Gradient w.r.t. inp[0] is W_quant^T @ grad_output —
+        #     the correct gradient direction for the quantised model.
+        #   - Surrogate weights are frozen (no grad needed for them anyway).
+        #   - The activation STE (out_wq + (out_dq - out_wq).detach()) gives
+        #     forward = out_dq (fully quantised), backward = identity w.r.t.
+        #     out_wq, so gradient flows through the quantised-weight forward.
         #
         # EyeQ4 uses symmetric per-tensor INT8 — the simplest hardware scheme.
-        out_dq, _ = _sym_fake_quant(out, bits)
-        # Straight-through: forward = quantised, backward = identity w.r.t. out.
-        return out + (out_dq - out.detach())
+
+        # Step 1: Weight quant — re-run forward with quantised weights
+        w_dq, _ = _sym_fake_quant(module.weight, bits)
+        if isinstance(module, nn.Conv2d):
+            out_wq = F.conv2d(inp[0], w_dq, module.bias,
+                              module.stride, module.padding, module.dilation,
+                              module.groups)
+        elif isinstance(module, nn.Linear):
+            out_wq = F.linear(inp[0], w_dq, module.bias)
+        else:
+            out_wq = out
+
+        # Step 2: Activation quant with STE
+        out_dq, _ = _sym_fake_quant(out_wq, bits)
+        # forward = out_dq (W+A quantised), backward = identity w.r.t. out_wq
+        return out_wq + (out_dq - out_wq).detach()
     return hook
 
 
