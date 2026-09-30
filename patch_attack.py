@@ -38,55 +38,41 @@ from model import build_surrogate, get_device, load as load_model, ARCH_CHOICES
 from eot import eot_batch, eot_print, eot_scene, install_fake_quant_hooks, FakeQuantSchedule
 
 
-# ── INT8 PTQ for eval models ────────────────────────────────────────────────
+# ── INT8 eval via deterministic fake-quant ──────────────────────────────────
+#
+# Instead of PyTorch's PTQ infrastructure (which needs backend-specific
+# quantised op kernels that don't exist for depthwise-separable convs on
+# aarch64), we hook the float models with deterministic fake-quant at
+# p=1.0 during eval.  Every Conv2d/Linear activation gets quantise→dequantise
+# on every forward — same information bottleneck as true INT8, just computed
+# in float.  Works on any architecture, any platform, any device.
 
-def _build_quantized_eval_model(fp_model: torch.nn.Module,
-                                 calibration_loader,
-                                 device: torch.device,
-                                 n_batches: int = 150) -> torch.nn.Module:
+def _build_quant_eval_hooks(model: torch.nn.Module,
+                             bits: int = 8) -> list:
     """
-    Post-training static quantisation of a surrogate to true INT8.
-    Used only for eval (no gradient flow) — gives ground-truth measurement
-    of whether the patch survives real quantisation.
-
-    Returns a CPU-only quantized model (PyTorch eager-mode quantization
-    doesn't support CUDA).
+    Install deterministic (p=1.0) symmetric per-tensor fake-quant hooks on
+    every Conv2d/Linear in `model`.  Returns the hook handles so they can be
+    removed later.  No schedule object needed — these are always-on.
     """
-    import copy
-    import torch.ao.quantization as tq
+    qmax = float(2 ** (bits - 1) - 1)  # 127 for 8-bit
 
-    model_fp = copy.deepcopy(fp_model).cpu().eval()
+    def _det_quant_hook(module, inp, out):
+        out_det = out.detach()
+        flat = out_det.reshape(-1).float()
+        if flat.numel() > 4096:
+            flat = flat[torch.randint(0, flat.numel(), (4096,), device=flat.device)]
+        amax = torch.quantile(flat.abs(), 0.995).clamp(min=1e-8)
+        scale   = amax / qmax
+        clipped = out_det.clamp(-amax, amax)
+        q       = torch.round(clipped / scale).clamp(-qmax, qmax)
+        dq      = q * scale
+        return dq  # no STE needed — eval only, no backward
 
-    # Fuse Conv-BN-ReLU and Linear-ReLU blocks where possible
-    # (this is what real inference engines do before quantising)
-    try:
-        model_fp = torch.ao.quantization.fuse_modules_qat(model_fp, [], inplace=False)
-    except Exception:
-        pass  # not all architectures have easily fuseable patterns — fine
-
-    # Set up per-tensor symmetric INT8 (matches EyeQ4 assumption)
-    model_fp.qconfig = tq.QConfig(
-        activation=tq.observer.MinMaxObserver.with_args(
-            dtype=torch.qint8, qscheme=torch.per_tensor_symmetric),
-        weight=tq.observer.MinMaxObserver.with_args(
-            dtype=torch.qint8, qscheme=torch.per_tensor_symmetric),
-    )
-    tq.prepare(model_fp, inplace=True)
-
-    # Calibrate — run real data through to collect activation ranges
-    with torch.no_grad():
-        for i, (imgs, _) in enumerate(calibration_loader):
-            if i >= n_batches:
-                break
-            model_fp(imgs.cpu())
-
-    # Convert observers → actual quantised ops
-    tq.convert(model_fp, inplace=True)
-
-    arch_name = getattr(fp_model, '_arch_name', 'unknown')
-    model_fp._arch_name = f"{arch_name}_int8"
-    print(f"  PTQ INT8 ready: {model_fp._arch_name} (calibrated on {min(i+1, n_batches)} batches)")
-    return model_fp
+    handles = []
+    for m in model.modules():
+        if isinstance(m, (torch.nn.Conv2d, torch.nn.Linear)):
+            handles.append(m.register_forward_hook(_det_quant_hook))
+    return handles
 
 
 # ── denormalise helper ───────────────────────────────────────────────────────
@@ -451,14 +437,18 @@ def optimise_patch(
                     for m in models
                 )
 
-                # Also measure on true INT8 quantised models if available
+                # Also measure with deterministic INT8 fake-quant if enabled
                 quant_asr_str = ""
                 if quant_eval_models:
-                    patched_cpu = patched_eot_log.cpu()
+                    # Install deterministic quant hooks, measure, remove
+                    _qh = {id(m): _build_quant_eval_hooks(m) for m in quant_eval_models}
                     quant_asr = min(
-                        (qm(patched_cpu).argmax(1) == target_label).float().mean().item()
-                        for qm in quant_eval_models
+                        (m(patched_eot_log).argmax(1) == target_label).float().mean().item()
+                        for m in quant_eval_models
                     )
+                    for m in quant_eval_models:
+                        for h in _qh[id(m)]:
+                            h.remove()
                     quant_asr_str = f"  qASR={quant_asr:.2%}"
 
             if _fq_was_enabled:
@@ -629,24 +619,15 @@ def main(args):
     target_label = KMH_TO_LABEL[args.target]
     print(f"Target: {args.target} km/h  (label {target_label})")
 
-    # ── Build true INT8 quantised copies for eval ──────────────────────────
+    # ── Prepare deterministic INT8 fake-quant hooks for eval ────────────────
+    # These are installed/removed around eval passes so the same float models
+    # can be used for both training (stochastic fake-quant via schedule) and
+    # eval (deterministic full-layer quant).  No separate model copies needed.
     quant_eval_models = None
     if not args.no_quant_eval:
-        print("\nBuilding PTQ INT8 eval models (calibrating)...")
-        cal_loader = torch.utils.data.DataLoader(
-            val_ds, batch_size=64, shuffle=True, num_workers=0,
-        )
-        quant_eval_models = []
-        for m in ensemble:
-            try:
-                qm = _build_quantized_eval_model(m, cal_loader, device)
-                quant_eval_models.append(qm)
-            except Exception as e:
-                print(f"  WARNING: PTQ failed for {m._arch_name}: {e} — skipping")
-        if not quant_eval_models:
-            print("  No models survived PTQ — falling back to float eval")
-            quant_eval_models = None
-        print()
+        quant_eval_models = ensemble  # same models, hooks toggled at eval time
+        print(f"Quant eval: deterministic INT8 fake-quant on all {len(ensemble)} "
+              f"surrogates during eval passes")
 
     patch_01, target_patch_px = optimise_patch(
         models       = ensemble,
@@ -693,15 +674,19 @@ def main(args):
                    cy_min=args.cy_min, cy_max=args.cy_max,
                    oblique_eot=args.oblique_eot)
 
-    # Final eval on true INT8 quantised models
+    # Final eval with deterministic INT8 fake-quant
     if quant_eval_models:
-        print("\n── INT8 PTQ eval (true quantisation, no STE) ──")
-        evaluate_patch(quant_eval_models, val_ds, patch_01.cpu(), target_label,
-                       target_patch_px=target_patch_px, device=torch.device('cpu'),
+        print("\n── INT8 eval (deterministic per-tensor symmetric quant) ──")
+        _qh = {id(m): _build_quant_eval_hooks(m) for m in quant_eval_models}
+        evaluate_patch(quant_eval_models, val_ds, patch_01, target_label,
+                       target_patch_px=target_patch_px, device=device,
                        n_eot=args.eot_samples,
                        cx_min=args.cx_min, cx_max=args.cx_max,
                        cy_min=args.cy_min, cy_max=args.cy_max,
                        oblique_eot=args.oblique_eot)
+        for m in quant_eval_models:
+            for h in _qh[id(m)]:
+                h.remove()
 
 
 if __name__ == "__main__":
