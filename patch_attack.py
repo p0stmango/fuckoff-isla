@@ -464,8 +464,10 @@ def optimise_patch(
             pbar.set_postfix(loss=f"{total_loss.item():.4f}",
                              ASR=f"{asr:.2%}{quant_asr_str}")
 
+            _inter_dir = Path("intermediate_examples")
+            _inter_dir.mkdir(exist_ok=True)
             arr = patch_01.detach().clamp(0, 1).squeeze(0).permute(1, 2, 0).cpu().numpy()
-            Image.fromarray((arr * 255).astype(np.uint8)).save(f"patch_step_{step:04d}.png")
+            Image.fromarray((arr * 255).astype(np.uint8)).save(_inter_dir / f"patch_step_{step:04d}.png")
 
     return patch_01.detach().clamp(0, 1), target_patch_px
 
