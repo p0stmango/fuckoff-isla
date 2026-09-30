@@ -424,45 +424,79 @@ def optimise_patch(
                 fake_quant_schedule.enabled = False
 
             with torch.no_grad():
-                patch_printed   = eot_print(patch_01.detach().clamp(0, 1))
-                patch_norm_det  = to_normalised(patch_printed)
-                cx_log = random.uniform(cx_min, cx_max)
-                cy_log = random.uniform(cy_min, cy_max)
-                patched_log     = apply_patch(imgs, patch_norm_det,
-                                              cx_frac=cx_log, cy_frac=cy_log,
-                                              randomise_placement=False,
-                                              target_patch_px=target_patch_px)
-                p_mask_log      = make_patch_mask(B, IMG_SIZE, IMG_SIZE,
-                                                  target_patch_px, cx_log, cy_log,
-                                                  device)
-                patched_01_log  = patched_log * std + mean
-                patched_01_log  = eot_scene(patched_01_log, oblique=oblique_eot,
-                                            patch_mask=p_mask_log)
-                patched_eot_log = (patched_01_log - mean) / std
-                # Report ASR as the worst-case (minimum) across all surrogates
-                asr = min(
-                    (m(patched_eot_log).argmax(1) == target_label).float().mean().item()
-                    for m in models
-                )
+                # Average over 4 EOT draws × full batch to reduce eval noise.
+                # With 1 draw × 32 images, ASR jumps in 3.12% increments and
+                # min-of-3-models is biased toward zero.  4 draws gives 128
+                # predictions per model — much more stable signal.
+                _n_eval_eot = 4
+                _per_model_hits = [0] * len(models)
+                _per_model_total = 0
+                for _ei in range(_n_eval_eot):
+                    patch_printed   = eot_print(patch_01.detach().clamp(0, 1))
+                    patch_norm_det  = to_normalised(patch_printed)
+                    cx_log = random.uniform(cx_min, cx_max)
+                    cy_log = random.uniform(cy_min, cy_max)
+                    patched_log     = apply_patch(imgs, patch_norm_det,
+                                                  cx_frac=cx_log, cy_frac=cy_log,
+                                                  randomise_placement=False,
+                                                  target_patch_px=target_patch_px)
+                    p_mask_log      = make_patch_mask(B, IMG_SIZE, IMG_SIZE,
+                                                      target_patch_px, cx_log, cy_log,
+                                                      device)
+                    patched_01_log  = patched_log * std + mean
+                    # Pass training_step so eval respects the same sensor
+                    # warmup gate as training — without this, eval applies
+                    # grayscale+CLAHE 50% of the time during steps 1-499 when
+                    # training NEVER sees it, making ASR look awful for free.
+                    patched_01_log  = eot_scene(patched_01_log, oblique=oblique_eot,
+                                                patch_mask=p_mask_log,
+                                                training_step=step)
+                    patched_eot_log = (patched_01_log - mean) / std
+                    for mi, m in enumerate(models):
+                        _per_model_hits[mi] += (m(patched_eot_log).argmax(1) == target_label).sum().item()
+                _per_model_total = B * _n_eval_eot
+                _per_model_asr = [h / _per_model_total for h in _per_model_hits]
+                asr = min(_per_model_asr)
+
+                # Per-model ASR string for tqdm — shows which model is the bottleneck
+                arch_names = [getattr(m, '_arch_name', f'm{i}')[:6] for i, m in enumerate(models)]
+                per_model_str = " ".join(f"{n}={a:.0%}" for n, a in zip(arch_names, _per_model_asr))
 
                 # Also measure with deterministic INT8 fake-quant if enabled
                 quant_asr_str = ""
                 if quant_eval_models:
-                    # Install deterministic quant hooks, measure, remove
                     _qh = {id(m): _build_quant_eval_hooks(m) for m in quant_eval_models}
-                    quant_asr = min(
-                        (m(patched_eot_log).argmax(1) == target_label).float().mean().item()
-                        for m in quant_eval_models
-                    )
+                    _q_hits = [0] * len(quant_eval_models)
+                    for _ei in range(_n_eval_eot):
+                        patch_printed   = eot_print(patch_01.detach().clamp(0, 1))
+                        patch_norm_det  = to_normalised(patch_printed)
+                        cx_log = random.uniform(cx_min, cx_max)
+                        cy_log = random.uniform(cy_min, cy_max)
+                        patched_log     = apply_patch(imgs, patch_norm_det,
+                                                      cx_frac=cx_log, cy_frac=cy_log,
+                                                      randomise_placement=False,
+                                                      target_patch_px=target_patch_px)
+                        p_mask_log      = make_patch_mask(B, IMG_SIZE, IMG_SIZE,
+                                                          target_patch_px, cx_log, cy_log,
+                                                          device)
+                        patched_01_log  = patched_log * std + mean
+                        patched_01_log  = eot_scene(patched_01_log, oblique=oblique_eot,
+                                                    patch_mask=p_mask_log,
+                                                    training_step=step)
+                        patched_eot_log = (patched_01_log - mean) / std
+                        for mi, m in enumerate(quant_eval_models):
+                            _q_hits[mi] += (m(patched_eot_log).argmax(1) == target_label).sum().item()
                     for m in quant_eval_models:
                         for h in _qh[id(m)]:
                             h.remove()
+                    quant_asr = min(h / _per_model_total for h in _q_hits)
                     quant_asr_str = f"  qASR={quant_asr:.2%}"
 
             if _fq_was_enabled:
                 fake_quant_schedule.enabled = True
             pbar.set_postfix(loss=f"{total_loss.item():.4f}",
-                             ASR=f"{asr:.2%}{quant_asr_str}")
+                             ASR=f"{asr:.2%}{quant_asr_str}",
+                             detail=per_model_str)
 
             _inter_dir = Path("intermediate_examples")
             _inter_dir.mkdir(exist_ok=True)
