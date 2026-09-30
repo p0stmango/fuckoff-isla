@@ -51,22 +51,30 @@ def _build_quant_eval_hooks(model: torch.nn.Module,
                              bits: int = 8) -> list:
     """
     Install deterministic (p=1.0) symmetric per-tensor fake-quant hooks on
-    every Conv2d/Linear in `model`.  Returns the hook handles so they can be
-    removed later.  No schedule object needed — these are always-on.
+    every Conv2d/Linear in `model` — both weights AND activations.
+    Returns the hook handles so they can be removed later.
+    No schedule object needed — these are always-on, eval-only.
     """
-    qmax = float(2 ** (bits - 1) - 1)  # 127 for 8-bit
+    from eot import _sym_fake_quant
 
     def _det_quant_hook(module, inp, out):
-        out_det = out.detach()
-        flat = out_det.reshape(-1).float()
-        if flat.numel() > 4096:
-            flat = flat[torch.randint(0, flat.numel(), (4096,), device=flat.device)]
-        amax = torch.quantile(flat.abs(), 0.995).clamp(min=1e-8)
-        scale   = amax / qmax
-        clipped = out_det.clamp(-amax, amax)
-        q       = torch.round(clipped / scale).clamp(-qmax, qmax)
-        dq      = q * scale
-        return dq  # no STE needed — eval only, no backward
+        # Weight quant — re-run layer with quantised weights
+        w_dq, _ = _sym_fake_quant(module.weight, bits)
+        w_orig = module.weight.data.clone()
+        module.weight.data = w_dq
+        if isinstance(module, torch.nn.Conv2d):
+            out_wq = F.conv2d(inp[0], module.weight.data, module.bias,
+                              module.stride, module.padding, module.dilation,
+                              module.groups)
+        elif isinstance(module, torch.nn.Linear):
+            out_wq = F.linear(inp[0], module.weight.data, module.bias)
+        else:
+            out_wq = out
+        module.weight.data = w_orig
+
+        # Activation quant
+        act_dq, _ = _sym_fake_quant(out_wq, bits)
+        return act_dq  # no STE needed — eval only, no backward
 
     handles = []
     for m in model.modules():
