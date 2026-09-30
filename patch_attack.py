@@ -288,7 +288,13 @@ def optimise_patch(
         if (fake_quant_schedule is not None and not fake_quant_schedule.enabled
                 and step >= fake_quant_warmup):
             fake_quant_schedule.enabled = True
-            pbar.write(f"[step {step}] fake-quant hooks enabled (warmup complete)")
+            pbar.write(f"[step {step}] fake-quant hooks enabled — "
+                       f"p ramps 0.05 → {fake_quant_schedule.p_max:.2f} "
+                       f"over {fake_quant_schedule.ramp_steps} steps")
+
+        # Advance the fake-quant p_apply ramp each step
+        if fake_quant_schedule is not None and fake_quant_schedule.enabled:
+            fake_quant_schedule.step()
 
         try:
             imgs, _ = next(data_iter)
@@ -363,6 +369,13 @@ def optimise_patch(
             patch_01.clamp_(0.0, 1.0)
 
         if step % 50 == 0:
+            # Disable fake-quant during eval so ASR reflects actual patch
+            # quality, not stochastic quant noise on this particular draw
+            _fq_was_enabled = (fake_quant_schedule is not None
+                               and fake_quant_schedule.enabled)
+            if _fq_was_enabled:
+                fake_quant_schedule.enabled = False
+
             with torch.no_grad():
                 patch_printed   = eot_print(patch_01.detach().clamp(0, 1))
                 patch_norm_det  = to_normalised(patch_printed)
@@ -384,6 +397,9 @@ def optimise_patch(
                     (m(patched_eot_log).argmax(1) == target_label).float().mean().item()
                     for m in models
                 )
+
+            if _fq_was_enabled:
+                fake_quant_schedule.enabled = True
             pbar.set_postfix(loss=f"{total_loss.item():.4f}", ASR=f"{asr:.2%}")
 
             arr = patch_01.detach().clamp(0, 1).squeeze(0).permute(1, 2, 0).cpu().numpy()
@@ -524,10 +540,15 @@ def main(args):
     fake_quant_schedule = None
     if not args.no_fake_quant:
         bits_choices = tuple(int(b) for b in args.fake_quant_bits.split(","))
-        fake_quant_schedule = FakeQuantSchedule(enabled=False)  # off until warmup elapses
-        print(f"Fake-quant EOT : bits={bits_choices}  p={args.fake_quant_p}  "
+        fake_quant_schedule = FakeQuantSchedule(
+            enabled=False,
+            p_max=args.fake_quant_p,
+            ramp_steps=args.fake_quant_ramp,
+        )
+        print(f"Fake-quant EOT : bits={bits_choices}  p_max={args.fake_quant_p}  "
               f"warmup={args.fake_quant_warmup} steps  "
-              f"(per-layer, per-forward — hooks stay live through eval too)")
+              f"ramp=0.05→{args.fake_quant_p} over {args.fake_quant_ramp} steps  "
+              f"(eval runs clean — no quant noise in ASR measurement)")
         for m in ensemble:
             handles, _ = install_fake_quant_hooks(
                 m, bits_choices=bits_choices, p_apply=args.fake_quant_p,
@@ -618,10 +639,13 @@ if __name__ == "__main__":
                    help="Disable fake-quant activation hooks (enabled by default)")
     p.add_argument("--fake-quant-bits", default="6,8",
                    help="Comma-separated bit-widths to sample per layer per forward")
-    p.add_argument("--fake-quant-p",  type=float, default=0.3,
-                   help="Probability a given layer is fake-quantised on a given forward")
+    p.add_argument("--fake-quant-p",  type=float, default=0.15,
+                   help="Max probability a given layer is fake-quantised on a given forward "
+                        "(ramps from 0.05 over --fake-quant-ramp steps)")
     p.add_argument("--fake-quant-warmup", type=int, default=200,
                    help="Steps of clean (unquantised) optimisation before enabling the hooks")
+    p.add_argument("--fake-quant-ramp", type=int, default=500,
+                   help="Steps over which p_apply linearly ramps from 0.05 to --fake-quant-p after warmup")
     # Placement range — train only over the off-centre region where the patch
     # will physically appear.  Defaults cover +60mm right / ±10mm vertical
     # with ±25mm human placement error.  cx/cy are fractions of image width/height
