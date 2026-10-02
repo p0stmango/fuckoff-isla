@@ -9,12 +9,13 @@ import argparse
 from pathlib import Path
 import torch
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 import torchvision.transforms as T
+import torch.nn.functional as F
 
 from dataset import FilteredGTSRB, val_transforms, ALL_SPEEDS, KMH_TO_LABEL
 from model import build_surrogate, get_device, load as load_model
-from patch_attack import apply_patch, make_circular_mask
+from patch_attack import apply_patch
 
 _MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
 _STD  = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
@@ -39,11 +40,11 @@ def make_grid(args):
     val_ds = FilteredGTSRB(args.data, split="test", transform=val_transforms, download=False)
 
     patch_01 = torch.load(args.patch, map_location="cpu", weights_only=True)
-    patch_size = patch_01.shape[-1]
+    if patch_01.dim() == 3:
+        patch_01 = patch_01.unsqueeze(0)
     mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
     std  = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
     patch_norm = ((patch_01.to(device) - mean) / std)
-    mask = make_circular_mask(patch_size, device)
 
     # collect one sample per class
     class_samples = {}
@@ -64,7 +65,8 @@ def make_grid(args):
     for row, (label, img_t) in enumerate(sorted(class_samples.items())):
         img_batch = img_t.unsqueeze(0).to(device)
         with torch.no_grad():
-            patched   = apply_patch(img_batch, patch_norm, mask)
+            # Rectangular patch — no mask needed
+            patched      = apply_patch(img_batch, patch_norm)
             clean_pred   = model(img_batch).argmax(1).item()
             patched_pred = model(patched).argmax(1).item()
 
@@ -86,7 +88,7 @@ def make_grid(args):
     canvas.save(args.out)
     print(f"Grid saved: {args.out}")
     print("Left column = clean, right column = patched")
-    print(f"Classes (top→bottom): {[ALL_SPEEDS[l] for l in sorted(class_samples)]}")
+    print(f"Classes (top->bottom): {[ALL_SPEEDS[l] for l in sorted(class_samples)]}")
 
 
 if __name__ == "__main__":
