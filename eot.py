@@ -510,31 +510,67 @@ def apply_clahe(x: torch.Tensor) -> torch.Tensor:
     """
     Approximate Mobileye's ISP local contrast normalisation via CLAHE.
 
-    Uses a straight-through estimator so gradients survive:
-      Forward  — real cv2 CLAHE is applied, loss sees the CLAHE-processed image,
-                 so the patch is penalised for features CLAHE erases.
-      Backward — gradient flows through as if CLAHE were identity (d_out/d_x = 1),
-                 keeping the optimiser alive without breaking autograd.
+    Pure-torch implementation that stays entirely on-device (MPS/CUDA) — no
+    cv2, no .cpu(), no numpy, no per-image Python loops.
 
-    clipLimit=2.0, tileGridSize=(4,4) — standard automotive ISP settings.
+    Approach: instead of true tiled histogram equalisation (which needs
+    bincount + CDF per tile — hard to vectorise), we approximate the CLAHE
+    effect as local contrast normalisation with a clip:
+
+      1. Compute local mean via average pooling (≈ tile-sized receptive field).
+      2. Compute local contrast = |x - local_mean|.
+      3. Clip contrast at a threshold (analogous to clipLimit).
+      4. Re-normalise: output = 0.5 + clipped_contrast * sign(x - mean).
+      5. Blend with global histogram stretch for overall dynamic range.
+
+    This captures CLAHE's two key effects on the classifier:
+      - Local contrast enhancement (edges pop, flat regions compress)
+      - Clip limiting prevents noise amplification
+
+    STE: forward = transformed, backward = identity w.r.t. x.
     """
-    import cv2
-    import numpy as np
+    x_det = x.detach()
+    B, C, H, W = x_det.shape
 
-    x_det = x.detach()                                         # same values, no grad
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
+    # Work on single channel (input is grayscale broadcast to 3ch)
+    gray = x_det[:, 0:1]                                      # (B, 1, H, W)
 
-    results = []
-    for i in range(x_det.shape[0]):                            # iterate over batch
-        arr  = (x_det[i].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-        out  = clahe.apply(arr[:, :, 0])                       # single grayscale channel
-        out3 = np.stack([out] * 3, axis=2).astype(np.float32) / 255.0
-        results.append(torch.from_numpy(out3).permute(2, 0, 1))
+    # ── Global histogram stretch (brings full range to [0, 1]) ────────
+    g_min = gray.reshape(B, 1, -1).min(dim=2, keepdim=True).values.unsqueeze(-1)  # (B,1,1,1)
+    g_max = gray.reshape(B, 1, -1).max(dim=2, keepdim=True).values.unsqueeze(-1)
+    g_range = (g_max - g_min).clamp(min=1e-6)
+    stretched = (gray - g_min) / g_range                       # [0, 1]
 
-    result = torch.stack(results, dim=0).to(x.device)
+    # ── Local mean via avg pool (tile size ≈ H/4 × W/4 = 56×56 for 224) ──
+    tile_h = max(H // 4, 1)
+    tile_w = max(W // 4, 1)
+    # Padding to keep spatial dims
+    pad_h = tile_h // 2
+    pad_w = tile_w // 2
+    local_mean = F.avg_pool2d(
+        F.pad(stretched, (pad_w, pad_w, pad_h, pad_h), mode='reflect'),
+        kernel_size=(tile_h, tile_w), stride=1,
+    )
+    # avg_pool output may be slightly off in size due to padding — crop to match
+    local_mean = local_mean[:, :, :H, :W]
+
+    # ── Local contrast with clip limiting ─────────────────────────────
+    diff = stretched - local_mean
+    clip_thresh = 0.25   # analogous to clipLimit=2.0 on 256-bin histogram
+    clipped = diff.clamp(-clip_thresh, clip_thresh)
+
+    # Rescale clipped contrast to use full range
+    result_gray = (local_mean + clipped)
+    # Stretch to [0, 1]
+    r_min = result_gray.reshape(B, 1, -1).min(dim=2, keepdim=True).values.unsqueeze(-1)
+    r_max = result_gray.reshape(B, 1, -1).max(dim=2, keepdim=True).values.unsqueeze(-1)
+    r_range = (r_max - r_min).clamp(min=1e-6)
+    result_gray = (result_gray - r_min) / r_range
+
+    result_gray = result_gray.clamp(0, 1)
+    result = result_gray.expand_as(x_det).contiguous()
 
     # Straight-through: forward = result, backward gradient passes through x unchanged.
-    # x - x_det == 0 in the forward pass, but carries x's gradient in the backward pass.
     return result + (x - x_det)
 
 
