@@ -425,6 +425,40 @@ def apply_crop_jitter(x: torch.Tensor) -> torch.Tensor:
     return x
 
 
+def apply_barrel_distortion(x: torch.Tensor) -> torch.Tensor:
+    """
+    Barrel/pincushion distortion from the S-Cam4's wide-angle (46° H-FOV) lens.
+
+    Automotive cameras use short focal lengths for wide coverage, which produces
+    radial distortion — straight lines bow outward (barrel) near the edges.
+    The EyeQ4 ISP corrects most of this, but residual distortion remains,
+    especially at the frame periphery where speed signs often appear.
+
+    k1 controls barrel (positive) vs pincushion (negative) distortion.
+    The range here spans from slight overcorrection (pincushion) to moderate
+    barrel — matching the residual after ISP correction on the S-Cam4.
+    """
+    B, C, H, W = x.shape
+    k1 = _rand(-0.15, 0.30)       # barrel distortion coefficient
+    if abs(k1) < 0.02:
+        return x
+
+    # Normalised pixel coordinates [-1, 1]
+    gy, gx = torch.meshgrid(
+        torch.linspace(-1, 1, H, device=x.device),
+        torch.linspace(-1, 1, W, device=x.device),
+        indexing="ij",
+    )
+    r2 = gx ** 2 + gy ** 2
+    # Radial distortion: r' = r * (1 + k1 * r^2)
+    factor = 1.0 + k1 * r2
+    gx_d = (gx * factor).clamp(-1, 1)
+    gy_d = (gy * factor).clamp(-1, 1)
+    grid = torch.stack([gx_d, gy_d], dim=-1).unsqueeze(0).expand(B, -1, -1, -1)
+    return F.grid_sample(x, grid, align_corners=True, padding_mode="border",
+                         mode="bilinear")
+
+
 def apply_windscreen_tint(x: torch.Tensor) -> torch.Tensor:
     tint_strength = _rand(0.0, 0.06)
     tint = torch.tensor([
@@ -568,6 +602,38 @@ def _sym_fake_quant(x: torch.Tensor, bits: int, subsample: int = 4096):
     return q * scale, scale
 
 
+def _asym_fake_quant(x: torch.Tensor, bits: int, subsample: int = 4096):
+    """
+    Asymmetric per-tensor fake-quantise — appropriate for post-ReLU activations
+    where the range is [0, max] rather than [-max, max].
+
+    EyeQ4 uses asymmetric quantisation for activations after ReLU/ReLU6:
+    the zero-point is calibrated to map exactly to 0, so the full [0, 2^bits-1]
+    range covers the non-negative activation range without wasting half the
+    levels on negative values that never occur.
+
+    Returns (dequantised_detached, scale, zero_point).
+    """
+    qmin = 0
+    qmax = float(2 ** bits - 1)                     # 255 for 8-bit
+
+    flat = x.detach().reshape(-1).float()
+    if flat.numel() > subsample:
+        flat = flat[torch.randint(0, flat.numel(), (subsample,), device=flat.device)]
+
+    x_min = torch.quantile(flat, 0.005).clamp(max=0.0)
+    x_max = torch.quantile(flat, 0.995).clamp(min=1e-8)
+
+    scale = (x_max - x_min) / qmax
+    scale = scale.clamp(min=1e-8)
+    zero_point = torch.round(-x_min / scale).clamp(qmin, qmax)
+
+    clipped = x.detach().clamp(x_min, x_max)
+    q = torch.round(clipped / scale + zero_point).clamp(qmin, qmax)
+    dq = (q - zero_point) * scale
+    return dq, scale, zero_point
+
+
 def _fake_quant_hook(bits_choices, p_apply, schedule):
     # Cache quantised weights per (module, bits) — the surrogates are frozen
     # during patch optimisation, so weights don't change between calls.
@@ -621,8 +687,18 @@ def _fake_quant_hook(bits_choices, p_apply, schedule):
             out_wq = out
 
         # Step 2: Activation quant with STE (activations change each forward —
-        # no cache, fresh scale each call, matching real per-batch calibration)
-        out_dq, _ = _sym_fake_quant(out_wq, bits)
+        # no cache, fresh scale each call, matching real per-batch calibration).
+        # Use asymmetric quant for activations — post-ReLU values are non-negative,
+        # so asymmetric [0, max] range avoids wasting half the quantisation levels
+        # on negative values.  EyeQ4's NPU uses asymmetric activation quant.
+        # For layers that may produce negative activations (pre-activation, BatchNorm
+        # output), fall back to symmetric.
+        if out_wq.min() >= -1e-6:
+            # Post-ReLU: asymmetric is optimal
+            out_dq, _, _ = _asym_fake_quant(out_wq, bits)
+        else:
+            # Pre-activation or negative range: symmetric
+            out_dq, _ = _sym_fake_quant(out_wq, bits)
         # forward = out_dq (W+A quantised), backward = identity w.r.t. out_wq
         return out_wq + (out_dq - out_wq).detach()
     return hook
@@ -682,6 +758,7 @@ GEOMETRY_TRANSFORMS = [
     apply_perspective_warp,
     apply_scale_jitter,
     apply_crop_jitter,
+    apply_barrel_distortion,
 ]
 
 LIGHTING_TRANSFORMS = [
@@ -763,13 +840,16 @@ def eot_scene(x: torch.Tensor, n_transforms: int = 3,
     if has_mask:
         x = torch.cat([x, patch_mask], dim=1)          # (B, 4, H, W)
 
-    # ── geometry (always all three, in order) ─────────────────────────────
+    # ── geometry (always all four, in order) ────────────────────────────
     if oblique and random.random() < 0.4:
         x = apply_oblique_perspective(x)
     else:
         x = apply_perspective_warp(x)
     x = apply_scale_jitter(x)
     x = apply_crop_jitter(x)
+    # Barrel distortion from the S-Cam4 wide-angle lens (applied ~60% of time)
+    if random.random() < 0.6:
+        x = apply_barrel_distortion(x)
 
     # ── split mask back out after geometry ─────────────────────────────
     if has_mask:
@@ -797,22 +877,22 @@ def eot_scene(x: torch.Tensor, n_transforms: int = 3,
     for fn in random.sample(CAMERA_TRANSFORMS, k=min(n_cam, len(CAMERA_TRANSFORMS))):
         x = fn(x)
 
-    # ── sensor: grayscale + CLAHE (50% of EOT samples) ─────────────────
-    # The target's monochrome sensor always sees grayscale+CLAHE, but the
-    # surrogates were trained on ~50% colour / ~50% grayscale (dataset.py
-    # RandomGrayscale p=0.5).  Gating to 50% keeps the gradient signal
-    # alive through colour features the surrogates actually learned, while
-    # still forcing the patch to survive the grayscale+CLAHE path half the
-    # time.  Without gating, 100% of gradient updates come through the
-    # CLAHE STE, which is a systematically wrong approximation — the
-    # optimizer doesn't know CLAHE's actual local effect on each pixel.
+    # ── sensor: grayscale + CLAHE ────────────────────────────────────
+    # The EyeQ4's S-Cam4 uses a monochrome CMOS sensor with CLAHE ISP —
+    # every frame the classifier sees is grayscale+CLAHE, so training
+    # must converge to that.
     #
-    # During early training (step < 500), skip grayscale+CLAHE entirely so
-    # the patch converges using richer colour gradients first.  The CLAHE
-    # STE is a coarse approximation that adds gradient noise — deferring it
-    # lets the optimiser find a good basin before hardening.
+    # Schedule:
+    #   step < 500  → skip entirely (let patch converge on colour gradients)
+    #   500 ≤ step < 1000 → 50% probability (gradual hardening)
+    #   step ≥ 1000 or eval (training_step is None) → 100% (match target)
+    #
+    # The CLAHE STE is a coarse approximation, so early colour-only steps
+    # let the optimiser find a good basin.  After step 1000 we commit to
+    # the monochrome pipeline because that's what the target always runs.
     _apply_sensor = (training_step is None or training_step >= 500)
-    if _apply_sensor and random.random() < 0.5:
+    _sensor_p = 1.0 if (training_step is None or training_step >= 1000) else 0.5
+    if _apply_sensor and random.random() < _sensor_p:
         x = apply_grayscale(x)
         x = apply_clahe(x)
 
