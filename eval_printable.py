@@ -37,9 +37,9 @@ _MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
 _STD  = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
 
 SURROGATE_CONFIGS = {
-    "resnet18":           ("surrogate.pt",                    "resnet18"),
-    "mobilenet_v3_large": ("surrogate_mobilenet_v3_large.pt", "mobilenet_v3_large"),
-    "efficientnet_b0":    ("surrogate_efficientnet_b0.pt",    "efficientnet_b0"),
+    "resnet18":           ("surrogate.pt",                         "resnet18"),
+    "mobilenet_v3_small": ("surrogate_mobilenet_v3_small.pt",      "mobilenet_v3_small"),
+    "efficientnet_b0":    ("surrogate_efficientnet_b0.pt",         "efficientnet_b0"),
 }
 
 
