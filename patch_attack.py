@@ -38,7 +38,8 @@ from dataset import (
     KMH_TO_LABEL, ALL_SPEEDS, IMG_SIZE, NUM_CLASSES,
 )
 from model import build_surrogate, get_device, load as load_model, ARCH_CHOICES
-from eot import eot_batch, eot_print, eot_scene, install_fake_quant_hooks, FakeQuantSchedule
+from eot import (eot_batch, eot_print, eot_scene, install_fake_quant_hooks,
+                 FakeQuantSchedule, _ste_clamp_01)
 
 
 # ── INT8 eval via deterministic fake-quant ──────────────────────────────────
@@ -51,32 +52,68 @@ from eot import eot_batch, eot_print, eot_scene, install_fake_quant_hooks, FakeQ
 # in float.  Works on any architecture, any platform, any device.
 
 def _build_quant_eval_hooks(model: torch.nn.Module,
-                             bits: int = 8) -> list:
+                             bits: int = 8,
+                             calibration_loader=None) -> list:
     """
-    Install deterministic (p=1.0) symmetric per-tensor fake-quant hooks on
-    every Conv2d/Linear in `model` — both weights AND activations.
+    Install deterministic (p=1.0) fake-quant hooks on every Conv2d/Linear in
+    `model` — weights use symmetric quant, activations use asymmetric (matching
+    EyeQ4's INT8 NPU: symmetric weights, asymmetric post-ReLU activations).
+
+    If calibration_loader is provided, run a calibration pass first to collect
+    per-layer activation statistics for more accurate scale/zero-point values.
     Returns the hook handles so they can be removed later.
-    No schedule object needed — these are always-on, eval-only.
     """
-    from eot import _sym_fake_quant
+    from eot import _sym_fake_quant, _asym_fake_quant
+
+    # Optional calibration: collect per-layer min/max statistics
+    _calibration_stats = {}
+    if calibration_loader is not None:
+        _cal_hooks = []
+        def _make_cal_hook(name):
+            def _cal(module, inp, out):
+                if name not in _calibration_stats:
+                    _calibration_stats[name] = {'min': float('inf'), 'max': float('-inf')}
+                _calibration_stats[name]['min'] = min(
+                    _calibration_stats[name]['min'], out.detach().min().item())
+                _calibration_stats[name]['max'] = max(
+                    _calibration_stats[name]['max'], out.detach().max().item())
+            return _cal
+
+        for name, m in model.named_modules():
+            if isinstance(m, (torch.nn.Conv2d, torch.nn.Linear)):
+                _cal_hooks.append(m.register_forward_hook(_make_cal_hook(name)))
+
+        model.eval()
+        with torch.no_grad():
+            for imgs, _ in calibration_loader:
+                model(imgs.to(next(model.parameters()).device))
+        for h in _cal_hooks:
+            h.remove()
+
+    # Cache quantised weights per module
+    _w_cache = {}
 
     def _det_quant_hook(module, inp, out):
-        # Weight quant — re-run layer with quantised weights
-        w_dq, _ = _sym_fake_quant(module.weight, bits)
-        w_orig = module.weight.data.clone()
-        module.weight.data = w_dq
+        # Weight quant — symmetric, cached (weights don't change during eval)
+        mid = id(module)
+        if mid not in _w_cache:
+            _w_cache[mid], _ = _sym_fake_quant(module.weight, bits)
+        w_dq = _w_cache[mid]
+
         if isinstance(module, torch.nn.Conv2d):
-            out_wq = F.conv2d(inp[0], module.weight.data, module.bias,
+            out_wq = F.conv2d(inp[0], w_dq, module.bias,
                               module.stride, module.padding, module.dilation,
                               module.groups)
         elif isinstance(module, torch.nn.Linear):
-            out_wq = F.linear(inp[0], module.weight.data, module.bias)
+            out_wq = F.linear(inp[0], w_dq, module.bias)
         else:
             out_wq = out
-        module.weight.data = w_orig
 
-        # Activation quant
-        act_dq, _ = _sym_fake_quant(out_wq, bits)
+        # Activation quant — asymmetric for post-ReLU, symmetric otherwise
+        if out_wq.min() >= -1e-6:
+            act_dq, _, _ = _asym_fake_quant(out_wq, bits)
+        else:
+            act_dq, _ = _sym_fake_quant(out_wq, bits)
         return act_dq  # no STE needed — eval only, no backward
 
     handles = []
@@ -289,6 +326,9 @@ def optimise_patch(
     init_patch:   str   = None,   # path to a saved patch tensor to resume from
     ensemble_weights: list = None, # per-model sampling weights (default: uniform)
     quant_eval_models: list = None, # PTQ INT8 models for eval ASR measurement
+    guided_init:  bool  = False,   # ZQBA guided backprop init (paper 2510.00769)
+    noise_sigma:  float = 0.0,     # Gaussian noise σ for gradient smoothing (ZQ-Attack)
+    sequential_ensemble: bool = False, # sequential ensemble optimisation (ZQ-Attack)
 ) -> torch.Tensor:
     """
     patch_size is the PRINT resolution of the patch (e.g. 945 = 8cm @ 300 DPI).
@@ -329,6 +369,55 @@ def optimise_patch(
         patch_01 = patch_01.clamp(0, 1).to(device)
     else:
         patch_01 = torch.rand(1, 3, patch_size, patch_size, device=device) * 0.5 + 0.25
+
+    target_t = torch.tensor([target_label], device=device)
+    mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+    std  = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+
+    def to_normalised(p_01):
+        return (p_01 - mean) / std
+
+    # ── ZQBA guided backprop init (paper 2510.00769) ─────────────────
+    # Single-step guided backpropagation: X_adv = α·(∇_X·f(X)) + X
+    # Provides a much better starting point than random noise by using
+    # the gradient of the target loss w.r.t. the input to initialise
+    # the patch in the direction that most increases target confidence.
+    if guided_init and init_patch is None:
+        print("Running ZQBA guided backprop init (α=0.4)...")
+        patch_01.requires_grad_(True)
+        _init_loss = torch.tensor(0.0, device=device)
+        _n_init = min(4, len(dataset))
+        _init_loader = torch.utils.data.DataLoader(
+            dataset, batch_size=min(batch_size, 16), shuffle=True, num_workers=0,
+        )
+        _init_imgs, _init_labels = next(iter(_init_loader))
+        _init_imgs = _init_imgs.to(device)
+        _init_labels = _init_labels.to(device)
+        _init_patch_norm = to_normalised(patch_01)
+        _init_patched = apply_patch(_init_imgs, _init_patch_norm,
+                                     target_patch_px=target_patch_px)
+        # Average gradient across all surrogates
+        for _m in models:
+            _logits = _m(_init_patched)
+            if loss_fn == "untargeted":
+                _init_loss = _init_loss + untargeted_loss(_logits, _init_labels)
+            else:
+                _init_loss = _init_loss + F.cross_entropy(
+                    _logits, target_t.expand(_init_imgs.size(0)))
+        _init_loss = _init_loss / len(models)
+        _init_loss.backward()
+        # ZQBA formula: X_adv = α·(∇_X·f(X)) + X, α = 0.4
+        _alpha = 0.4
+        with torch.no_grad():
+            _grad = patch_01.grad
+            # Guided backprop: keep only positive gradients × positive activations
+            _guided_grad = F.relu(_grad) * F.relu(patch_01)
+            if _guided_grad.abs().max() > 1e-8:
+                _guided_grad = _guided_grad / _guided_grad.abs().max()
+            patch_01.data = (patch_01.data - _alpha * _guided_grad).clamp(0, 1)
+            patch_01.grad = None
+        print(f"  Init loss: {_init_loss.item():.4f}")
+
     patch_01.requires_grad_(True)
 
     optimizer = torch.optim.Adam([patch_01], lr=lr)
@@ -343,13 +432,6 @@ def optimise_patch(
         num_workers=0, drop_last=True,
     )
     data_iter = iter(loader)
-
-    target_t = torch.tensor([target_label], device=device)
-    mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
-    std  = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
-
-    def to_normalised(p_01):
-        return (p_01 - mean) / std
 
     best_asr   = -1.0
     best_patch = patch_01.detach().clone()
@@ -383,47 +465,84 @@ def optimise_patch(
         patch_norm = to_normalised(patch_01)
         total_loss = torch.tensor(0.0, device=device)
 
-        for _ in range(eot_samples):
-            # Sample one surrogate per EOT step — prevents the patch from
-            # exploiting any single model's blind spots.
-            # When ensemble_weights is set, bias sampling toward the most
-            # architecturally-similar surrogate (e.g. MobileNetV3 for EyeQ4).
-            surrogate = random.choices(models, weights=ensemble_weights, k=1)[0]
-            # Sample placement from the off-centre region where the patch
-            # will actually be mounted — avoids overlaying the sign numeral
-            # and trains across the full range of physical placement error.
-            cx = random.uniform(cx_min, cx_max)
-            cy = random.uniform(cy_min, cy_max)
+        if sequential_ensemble:
+            # ── Sequential ensemble optimisation (ZQ-Attack 2406.19311) ──
+            # Each model incorporates predecessors' gradients:
+            #   δ_j = δ_0 - α·(1/j)·Σ∇_δ' L(x, δ'+σ, t, f_j)
+            # This ensures each surrogate refines rather than overrides the
+            # previous models' perturbation direction.
+            for eot_i in range(eot_samples):
+                cx = random.uniform(cx_min, cx_max)
+                cy = random.uniform(cy_min, cy_max)
 
-            # Print EOT on the patch BEFORE compositing — only the patch
-            # goes through a printer; the sign is retroreflective aluminium.
-            patch_01_printed = eot_print(patch_01.clamp(0, 1))
-            patch_norm_eot   = to_normalised(patch_01_printed)
+                for mi, surrogate in enumerate(models):
+                    patch_01_printed = eot_print(patch_01.clamp(0, 1))
 
-            patched     = apply_patch(imgs, patch_norm_eot, cx_frac=cx, cy_frac=cy,
+                    # Gaussian noise injection for gradient smoothing
+                    if noise_sigma > 0:
+                        noise = torch.randn_like(patch_01_printed) * noise_sigma
+                        patch_01_printed = _ste_clamp_01(patch_01_printed + noise)
+
+                    patch_norm_eot = to_normalised(patch_01_printed)
+                    patched = apply_patch(imgs, patch_norm_eot, cx_frac=cx, cy_frac=cy,
+                                          randomise_placement=False,
+                                          target_patch_px=target_patch_px)
+                    p_mask = make_patch_mask(B, IMG_SIZE, IMG_SIZE, target_patch_px,
+                                            cx, cy, device)
+                    patched_01 = patched * std + mean
+                    patched_01 = eot_scene(patched_01.clone(), oblique=oblique_eot,
+                                            patch_mask=p_mask, training_step=step)
+                    patched_eot = (patched_01 - mean) / std
+
+                    logits = surrogate(patched_eot)
+                    if loss_fn == "untargeted":
+                        loss = untargeted_loss(logits, labels, margin=cw_margin)
+                    elif loss_fn == "margin":
+                        loss = margin_loss(logits, target_t.expand(B), margin=cw_margin)
+                    else:
+                        loss = F.cross_entropy(logits, target_t.expand(B))
+                    # Weight: 1/(j+1) so later models refine rather than dominate
+                    w = 1.0 / (mi + 1)
+                    total_loss = total_loss + w * loss
+
+            total_loss = total_loss / (eot_samples * sum(1.0 / (i + 1) for i in range(len(models))))
+        else:
+            # ── Original random surrogate sampling ──────────────────────
+            for _ in range(eot_samples):
+                # Sample one surrogate per EOT step — prevents the patch from
+                # exploiting any single model's blind spots.
+                surrogate = random.choices(models, weights=ensemble_weights, k=1)[0]
+                cx = random.uniform(cx_min, cx_max)
+                cy = random.uniform(cy_min, cy_max)
+
+                patch_01_printed = eot_print(patch_01.clamp(0, 1))
+
+                # Gaussian noise injection for gradient smoothing
+                if noise_sigma > 0:
+                    noise = torch.randn_like(patch_01_printed) * noise_sigma
+                    patch_01_printed = _ste_clamp_01(patch_01_printed + noise)
+
+                patch_norm_eot = to_normalised(patch_01_printed)
+                patched = apply_patch(imgs, patch_norm_eot, cx_frac=cx, cy_frac=cy,
                                       randomise_placement=False,
                                       target_patch_px=target_patch_px)
-            # Build patch mask for differential retroreflection — tells
-            # eot_scene which pixels are matte patch vs retroreflective sign.
-            p_mask = make_patch_mask(B, IMG_SIZE, IMG_SIZE, target_patch_px,
-                                    cx, cy, device)
-            # Scene EOT on the composited image — geometry, lighting, camera,
-            # sensor all happen to the sign+patch together in the real world.
-            patched_01  = patched * std + mean
-            patched_01  = eot_scene(patched_01.clone(), oblique=oblique_eot,
-                                    patch_mask=p_mask, training_step=step)
-            patched_eot = (patched_01 - mean) / std
+                p_mask = make_patch_mask(B, IMG_SIZE, IMG_SIZE, target_patch_px,
+                                        cx, cy, device)
+                patched_01 = patched * std + mean
+                patched_01 = eot_scene(patched_01.clone(), oblique=oblique_eot,
+                                        patch_mask=p_mask, training_step=step)
+                patched_eot = (patched_01 - mean) / std
 
-            logits = surrogate(patched_eot)
-            if loss_fn == "untargeted":
-                loss = untargeted_loss(logits, labels, margin=cw_margin)
-            elif loss_fn == "margin":
-                loss = margin_loss(logits, target_t.expand(B), margin=cw_margin)
-            else:
-                loss = F.cross_entropy(logits, target_t.expand(B))
-            total_loss = total_loss + loss
+                logits = surrogate(patched_eot)
+                if loss_fn == "untargeted":
+                    loss = untargeted_loss(logits, labels, margin=cw_margin)
+                elif loss_fn == "margin":
+                    loss = margin_loss(logits, target_t.expand(B), margin=cw_margin)
+                else:
+                    loss = F.cross_entropy(logits, target_t.expand(B))
+                total_loss = total_loss + loss
 
-        total_loss = total_loss / eot_samples
+            total_loss = total_loss / eot_samples
 
         # TV loss — force spatial coherence at print resolution
         if tv_weight > 0:
@@ -750,6 +869,9 @@ def main(args):
         ensemble_weights    = [float(w) for w in args.ensemble_weights.split(",")]
                               if args.ensemble_weights else None,
         quant_eval_models   = quant_eval_models,
+        guided_init         = args.guided_init,
+        noise_sigma         = args.noise_sigma,
+        sequential_ensemble = args.sequential_ensemble,
     )
 
     torch.save(patch_01, args.out)
@@ -847,4 +969,14 @@ if __name__ == "__main__":
                    help="Min patch centre Y fraction (0=top, 0.5=sign centre)")
     p.add_argument("--cy-max",        type=float, default=0.58,
                    help="Max patch centre Y fraction")
+    # Paper-derived techniques
+    p.add_argument("--guided-init",   action="store_true", default=False,
+                   help="ZQBA guided backprop init (paper 2510.00769) — uses "
+                        "single-step gradient to initialise patch instead of random noise")
+    p.add_argument("--noise-sigma",   type=float, default=0.0,
+                   help="Gaussian noise σ for gradient smoothing (ZQ-Attack paper). "
+                        "0 = disabled, try 0.01-0.05 for smoother gradients.")
+    p.add_argument("--sequential-ensemble", action="store_true", default=False,
+                   help="Sequential ensemble optimisation (ZQ-Attack 2406.19311) — "
+                        "each model incorporates predecessors' gradients with 1/j weighting")
     main(p.parse_args())
