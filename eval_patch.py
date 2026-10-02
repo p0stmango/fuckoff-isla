@@ -1,6 +1,7 @@
 """
 Overlay the optimised patch on a 5 km/h sign, apply EOT, and report per-model
-predictions across N EOT samples.
+predictions across N EOT samples.  Includes multi-scale evaluation and
+temporal majority voting simulation.
 
 Usage:
     # Use a random 5 km/h sign from the AU synth val set
@@ -14,6 +15,12 @@ Usage:
 
     # More EOT samples for a stable vote
     python eval_patch.py --n-eot 64
+
+    # Multi-scale evaluation (multiple viewing distances)
+    python eval_patch.py --multi-scale
+
+    # Temporal voting simulation (EyeQ4-style frame-level majority vote)
+    python eval_patch.py --temporal-frames 11
 """
 import argparse
 import random
@@ -59,6 +66,16 @@ def main(args):
     target_patch_px = max(4, int(int(224 * 0.80) * (args.print_cm * 10) / args.sign_diam_mm))
     print(f"Patch footprint in model input : {target_patch_px}px")
 
+    # ── multi-scale footprints (simulate different viewing distances) ─────────
+    if args.multi_scale:
+        # At 2x distance the sign is half the size → patch is half the pixels.
+        # Simulate 0.5x, 0.75x, 1.0x, 1.25x, 1.5x of the nominal distance.
+        scale_factors = [0.67, 0.80, 1.0, 1.25, 1.5]
+        multi_patch_px = [max(4, int(target_patch_px / s)) for s in scale_factors]
+        print(f"Multi-scale footprints: {list(zip(scale_factors, multi_patch_px))}")
+    else:
+        multi_patch_px = [target_patch_px]
+
     # ── get a sign image ─────────────────────────────────────────────────────
     true_label = KMH_TO_LABEL[args.true_speed]
     if args.sign:
@@ -95,9 +112,12 @@ def main(args):
 
     with torch.no_grad():
         for _ in range(args.n_eot):
+            # Sample a scale if multi-scale is enabled
+            tpp = random.choice(multi_patch_px)
+
             patched    = apply_patch(sign_img, patch_norm,
                                      randomise_placement=False,
-                                     target_patch_px=target_patch_px)
+                                     target_patch_px=tpp)
             patched_01 = patched * std + mean
             patched_01 = eot_batch(patched_01.clone(), oblique=args.oblique_eot)
             patched_eot = (patched_01 - mean) / std
@@ -119,6 +139,46 @@ def main(args):
     worst_asr = min(v[target_pred] / args.n_eot for v in votes.values())
     print(f"\n  Ensemble worst-case ASR@80 : {worst_asr:.1%}")
 
+    # ── temporal majority voting simulation ──────────────────────────────────
+    # The EyeQ4 uses temporal majority voting across consecutive frames to
+    # reject transient misclassifications.  A physical attack must fool the
+    # classifier on >50% of frames in the voting window.
+    if args.temporal_frames > 1:
+        n_frames = args.temporal_frames
+        n_trials = args.temporal_trials
+        print(f"\n── Temporal Majority Voting ({n_frames} frames × {n_trials} trials) ──")
+        print(f"  Simulates EyeQ4 frame-level voting: attack succeeds only if")
+        print(f"  >{n_frames // 2} of {n_frames} consecutive frames are misclassified.\n")
+
+        temporal_wins = {name: 0 for name in models}
+        for trial in range(n_trials):
+            for name, m in models.items():
+                frame_preds = []
+                for _ in range(n_frames):
+                    tpp = random.choice(multi_patch_px)
+                    patched = apply_patch(sign_img, patch_norm,
+                                          randomise_placement=False,
+                                          target_patch_px=tpp)
+                    patched_01 = patched * std + mean
+                    patched_01 = eot_batch(patched_01.clone(), oblique=args.oblique_eot)
+                    patched_eot = (patched_01 - mean) / std
+                    pred = m(patched_eot).argmax(1).item()
+                    frame_preds.append(pred)
+
+                # Majority vote: attack succeeds if target wins the vote
+                from collections import Counter
+                vote_result = Counter(frame_preds).most_common(1)[0][0]
+                if vote_result == target_pred:
+                    temporal_wins[name] += 1
+
+        print(f"  {'Model':<25}  {'Temporal ASR':>12}")
+        print("  " + "─" * 40)
+        for name, wins in temporal_wins.items():
+            t_asr = wins / n_trials
+            print(f"  {name:<25}  {t_asr:>11.1%}")
+        worst_temporal = min(w / n_trials for w in temporal_wins.values())
+        print(f"\n  Ensemble worst-case temporal ASR : {worst_temporal:.1%}")
+
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
@@ -133,6 +193,15 @@ if __name__ == "__main__":
                    help="Number of EOT samples for the vote")
     p.add_argument("--print-cm",      type=float, default=8.0)
     p.add_argument("--sign-diam-mm",  type=float, default=190.0)
-    p.add_argument("--oblique-eot",  action="store_true", default=False,
+    p.add_argument("--oblique-eot",   action="store_true", default=False,
                    help="Mix in extreme oblique viewing angles for close roadside signs")
+    # Multi-scale evaluation
+    p.add_argument("--multi-scale",   action="store_true", default=False,
+                   help="Evaluate at multiple viewing distances (0.67x to 1.5x)")
+    # Temporal voting simulation
+    p.add_argument("--temporal-frames", type=int, default=1,
+                   help="Number of frames in the temporal voting window "
+                        "(1 = no voting, 11 = EyeQ4-style majority vote)")
+    p.add_argument("--temporal-trials", type=int, default=50,
+                   help="Number of independent voting windows to simulate")
     main(p.parse_args())
