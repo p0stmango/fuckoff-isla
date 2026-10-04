@@ -192,7 +192,8 @@ if __name__ == "__main__":
     p.add_argument("--n-eot",         type=int,   default=32,
                    help="Number of EOT samples for the vote")
     p.add_argument("--print-cm",      type=float, default=8.0)
-    p.add_argument("--sign-diam-mm",  type=float, default=190.0)
+    p.add_argument("--sign-diam-mm",  type=float, default=450.0,
+                   help="Physical sign diameter in mm (AU=450, EU=190)")
     p.add_argument("--oblique-eot",   action="store_true", default=False,
                    help="Mix in extreme oblique viewing angles for close roadside signs")
     # Multi-scale evaluation
