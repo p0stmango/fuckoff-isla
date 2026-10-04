@@ -310,8 +310,7 @@ def optimise_patch(
     device:       torch.device = None,
     universal:    bool  = True,
     print_cm:     float = 8.0,
-    sign_diam_mm: float = 190.0,
-    real_sign_mm: float = 450.0,
+    sign_diam_mm: float = 450.0,
     nps_weight:   float = 0.01,
     tv_weight:    float = 0.05,
     cx_min:       float = 0.62,
@@ -329,6 +328,8 @@ def optimise_patch(
     guided_init:  bool  = False,   # ZQBA guided backprop init (paper 2510.00769)
     noise_sigma:  float = 0.0,     # Gaussian noise σ for gradient smoothing (ZQ-Attack)
     sequential_ensemble: bool = False, # sequential ensemble optimisation (ZQ-Attack)
+    eval_every:   int   = 100,     # held-out eval interval (steps)
+    night_mode:   bool  = False,   # bias EOT toward night conditions
 ) -> torch.Tensor:
     """
     patch_size is the PRINT resolution of the patch (e.g. 945 = 8cm @ 300 DPI).
@@ -347,8 +348,10 @@ def optimise_patch(
     patch_mm        = print_cm * 10.0
     sign_input_px   = int(224 * 0.80)                  # ~179px sign in 224px input
     target_patch_px = max(4, int(sign_input_px * patch_mm / sign_diam_mm))
+    print(f"Sign diameter   : {sign_diam_mm}mm")
     print(f"Print-res patch : {patch_size}px  ({print_cm}cm @ 300 DPI)")
-    print(f"Model footprint : {target_patch_px}px  in 224px input")
+    print(f"Model footprint : {target_patch_px}px  in 224px input  "
+          f"({patch_mm:.0f}mm patch on {sign_diam_mm:.0f}mm sign = {patch_mm/sign_diam_mm:.1%} coverage)")
     print(f"Loss function   : {loss_fn}" + (f"  (margin={cw_margin})" if loss_fn == "margin" else ""))
     print(f"Ensemble size   : {len(models)} model(s): "
           f"{[getattr(m, '_arch_name', '?') for m in models]}")
@@ -421,7 +424,14 @@ def optimise_patch(
     patch_01.requires_grad_(True)
 
     optimizer = torch.optim.Adam([patch_01], lr=lr)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=steps)
+    # Warm restarts prevent late-run collapse: cosine decay to near-zero LR
+    # while EOT variance stays fixed causes the patch to drift on noise once
+    # the margin loss gradients shrink at high ASR.  Restarting every T_0 steps
+    # spikes the LR back up so the optimiser can escape bad basins.
+    restart_period = max(200, steps // 5)   # ~5 restarts per run
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_0=restart_period, T_mult=1,
+    )
 
     sub_ds = dataset if universal else torch.utils.data.Subset(
         dataset, [i for i, (_, l) in enumerate(dataset) if l != target_label]
@@ -432,6 +442,22 @@ def optimise_patch(
         num_workers=0, drop_last=True,
     )
     data_iter = iter(loader)
+
+    # ── Held-out eval batch (fixed seed for comparability across steps) ──
+    # Sample once, reuse every eval — same images, same EOT seed each time,
+    # so ASR numbers are directly comparable step-to-step.
+    _eval_rng = torch.Generator()
+    _eval_rng.manual_seed(42)
+    _eval_indices = torch.randperm(len(sub_ds), generator=_eval_rng)[:batch_size].tolist()
+    _eval_subset = torch.utils.data.Subset(sub_ds, _eval_indices)
+    _eval_loader = torch.utils.data.DataLoader(
+        _eval_subset, batch_size=batch_size, shuffle=False, num_workers=0,
+    )
+    _eval_imgs, _eval_labels = next(iter(_eval_loader))
+    _eval_imgs = _eval_imgs.to(device)
+    _eval_labels = _eval_labels.to(device)
+    _eval_B = _eval_imgs.size(0)
+    print(f"Held-out eval : {_eval_B} images, evaluated every {eval_every} steps")
 
     best_asr   = -1.0
     best_patch = patch_01.detach().clone()
@@ -491,7 +517,8 @@ def optimise_patch(
                                             cx, cy, device)
                     patched_01 = patched * std + mean
                     patched_01 = eot_scene(patched_01.clone(), oblique=oblique_eot,
-                                            patch_mask=p_mask, training_step=step)
+                                            patch_mask=p_mask, training_step=step,
+                                            night_mode=night_mode)
                     patched_eot = (patched_01 - mean) / std
 
                     logits = surrogate(patched_eot)
@@ -530,7 +557,8 @@ def optimise_patch(
                                         cx, cy, device)
                 patched_01 = patched * std + mean
                 patched_01 = eot_scene(patched_01.clone(), oblique=oblique_eot,
-                                        patch_mask=p_mask, training_step=step)
+                                        patch_mask=p_mask, training_step=step,
+                                        night_mode=night_mode)
                 patched_eot = (patched_01 - mean) / std
 
                 logits = surrogate(patched_eot)
@@ -558,6 +586,11 @@ def optimise_patch(
         optimizer.step()
         scheduler.step()
 
+        # Log LR restart events so we can correlate with ASR recovery
+        cur_lr = optimizer.param_groups[0]["lr"]
+        if step > 1 and step % restart_period == 0:
+            print(f"  [step {step}] LR warm restart → {cur_lr:.6f}")
+
         # Flush MPS allocator every 5 steps to prevent memory fragmentation
         # that causes progressive slowdown on Apple Silicon (4s → 170s+/iter)
         if device.type == "mps" and step % 5 == 0:
@@ -566,7 +599,7 @@ def optimise_patch(
         with torch.no_grad():
             patch_01.clamp_(0.0, 1.0)
 
-        if step % 50 == 0:
+        if step % eval_every == 0:
             # Disable fake-quant during eval so ASR reflects actual patch
             # quality, not stochastic quant noise on this particular draw
             _fq_was_enabled = (fake_quant_schedule is not None
@@ -575,43 +608,45 @@ def optimise_patch(
                 fake_quant_schedule.enabled = False
 
             with torch.no_grad():
-                # Average over 4 EOT draws × full batch to reduce eval noise.
-                # With 1 draw × 32 images, ASR jumps in 3.12% increments and
-                # min-of-3-models is biased toward zero.  4 draws gives 128
-                # predictions per model — much more stable signal.
+                # Use the held-out eval batch with a fixed EOT seed so that
+                # ASR numbers are directly comparable across steps.  The same
+                # images + same random placements every eval = no noise from
+                # batch sampling.
                 _n_eval_eot = 4
                 _per_model_hits = [0] * len(models)
-                _per_model_total = 0
+                _eval_state = random.getstate()  # save RNG state
+                random.seed(step * 31337)        # deterministic EOT per step but varied across steps
                 for _ei in range(_n_eval_eot):
                     patch_printed   = eot_print(patch_01.detach().clamp(0, 1))
                     patch_norm_det  = to_normalised(patch_printed)
                     cx_log = random.uniform(cx_min, cx_max)
                     cy_log = random.uniform(cy_min, cy_max)
-                    patched_log     = apply_patch(imgs, patch_norm_det,
+                    patched_log     = apply_patch(_eval_imgs, patch_norm_det,
                                                   cx_frac=cx_log, cy_frac=cy_log,
                                                   randomise_placement=False,
                                                   target_patch_px=target_patch_px)
-                    p_mask_log      = make_patch_mask(B, IMG_SIZE, IMG_SIZE,
+                    p_mask_log      = make_patch_mask(_eval_B, IMG_SIZE, IMG_SIZE,
                                                       target_patch_px, cx_log, cy_log,
                                                       device)
                     patched_01_log  = patched_log * std + mean
-                    # Pass training_step so eval respects the same sensor
-                    # warmup gate as training — without this, eval applies
-                    # grayscale+CLAHE 50% of the time during steps 1-499 when
-                    # training NEVER sees it, making ASR look awful for free.
                     patched_01_log  = eot_scene(patched_01_log, oblique=oblique_eot,
                                                 patch_mask=p_mask_log,
-                                                training_step=step)
+                                                training_step=step,
+                                                night_mode=night_mode)
                     patched_eot_log = (patched_01_log - mean) / std
                     for mi, m in enumerate(models):
                         preds = m(patched_eot_log).argmax(1)
                         if loss_fn == "untargeted":
-                            _per_model_hits[mi] += (preds != labels).sum().item()
+                            _per_model_hits[mi] += (preds != _eval_labels).sum().item()
                         else:
                             _per_model_hits[mi] += (preds == target_label).sum().item()
-                _per_model_total = B * _n_eval_eot
+                random.setstate(_eval_state)     # restore RNG so training isn't disturbed
+                _per_model_total = _eval_B * _n_eval_eot
+                # Use MEAN across models, not MIN — min-of-3 is too pessimistic
+                # during training and makes the progress bar useless.  Final eval
+                # still uses min (worst-case) for the real number.
                 _per_model_asr = [h / _per_model_total for h in _per_model_hits]
-                asr = min(_per_model_asr)
+                asr = sum(_per_model_asr) / len(_per_model_asr)
 
                 # Per-model ASR string for tqdm — shows which model is the bottleneck
                 arch_names = [getattr(m, '_arch_name', f'm{i}')[:6] for i, m in enumerate(models)]
@@ -622,48 +657,58 @@ def optimise_patch(
                 if quant_eval_models:
                     _qh = {id(m): _build_quant_eval_hooks(m) for m in quant_eval_models}
                     _q_hits = [0] * len(quant_eval_models)
+                    random.seed(step * 31337 + 1)  # same placements as float eval
                     for _ei in range(_n_eval_eot):
                         patch_printed   = eot_print(patch_01.detach().clamp(0, 1))
                         patch_norm_det  = to_normalised(patch_printed)
                         cx_log = random.uniform(cx_min, cx_max)
                         cy_log = random.uniform(cy_min, cy_max)
-                        patched_log     = apply_patch(imgs, patch_norm_det,
+                        patched_log     = apply_patch(_eval_imgs, patch_norm_det,
                                                       cx_frac=cx_log, cy_frac=cy_log,
                                                       randomise_placement=False,
                                                       target_patch_px=target_patch_px)
-                        p_mask_log      = make_patch_mask(B, IMG_SIZE, IMG_SIZE,
+                        p_mask_log      = make_patch_mask(_eval_B, IMG_SIZE, IMG_SIZE,
                                                           target_patch_px, cx_log, cy_log,
                                                           device)
                         patched_01_log  = patched_log * std + mean
                         patched_01_log  = eot_scene(patched_01_log, oblique=oblique_eot,
                                                     patch_mask=p_mask_log,
-                                                    training_step=step)
+                                                    training_step=step,
+                                                    night_mode=night_mode)
                         patched_eot_log = (patched_01_log - mean) / std
                         for mi, m in enumerate(quant_eval_models):
                             preds_q = m(patched_eot_log).argmax(1)
                             if loss_fn == "untargeted":
-                                _q_hits[mi] += (preds_q != labels).sum().item()
+                                _q_hits[mi] += (preds_q != _eval_labels).sum().item()
                             else:
                                 _q_hits[mi] += (preds_q == target_label).sum().item()
+                    random.setstate(_eval_state)
                     for m in quant_eval_models:
                         for h in _qh[id(m)]:
                             h.remove()
-                    quant_asr = min(h / _per_model_total for h in _q_hits)
+                    quant_asr = sum(h / _per_model_total for h in _q_hits) / len(_q_hits)
                     quant_asr_str = f"  qASR={quant_asr:.2%}"
 
-            # ── save best patch by min-ASR ────────────────────────────
+            # ── save best patch by mean-ASR on held-out batch ─────────
             if asr > best_asr:
                 best_asr   = asr
                 best_patch = patch_01.detach().clamp(0, 1).clone()
                 _best_step = step
                 _best_detail = per_model_str
-                pbar.write(f"[step {step}] ★ new best ASR={asr:.2%}  ({per_model_str})")
+                pbar.write(f"[step {step}] ★ new best eval ASR={asr:.2%}  ({per_model_str})")
+                # Save best patch checkpoint immediately
+                _inter_dir = Path("intermediate_examples")
+                _inter_dir.mkdir(exist_ok=True)
+                _best_arr = best_patch.squeeze(0).permute(1, 2, 0).cpu().numpy()
+                Image.fromarray((_best_arr * 255).astype(np.uint8)).save(
+                    _inter_dir / "patch_best.png")
+                torch.save(best_patch, _inter_dir / "patch_best.pt")
 
             if _fq_was_enabled:
                 fake_quant_schedule.enabled = True
             pbar.set_postfix(loss=f"{total_loss.item():.4f}",
                              ASR=f"{asr:.2%}{quant_asr_str}",
-                             best=f"{best_asr:.2%}",
+                             best=f"{best_asr:.2%}@{_best_step}",
                              detail=per_model_str)
 
             _inter_dir = Path("intermediate_examples")
@@ -707,6 +752,7 @@ def evaluate_patch(
     cy_max:          float = 0.58,
     oblique_eot:     bool  = False,
     loss_fn:         str   = "ce",
+    night_mode:      bool  = False,
 ):
     """
     Evaluate ASR independently on each surrogate so you can see per-arch
@@ -753,7 +799,8 @@ def evaluate_patch(
                                                   target_patch_px, cx, cy, device)
                     patched_01  = patched * std + mean
                     patched_01  = eot_scene(patched_01, oblique=oblique_eot,
-                                            patch_mask=p_mask_ev)
+                                            patch_mask=p_mask_ev,
+                                            night_mode=night_mode)
                     patched_eot = (patched_01 - mean) / std
                     preds       = m(patched_eot).argmax(1)
                     if loss_fn == "untargeted":
@@ -864,6 +911,7 @@ def main(args):
         device       = device,
         universal    = args.universal,
         print_cm     = args.print_cm,
+        sign_diam_mm = args.sign_diam_mm,
         nps_weight   = args.nps_weight,
         tv_weight    = args.tv_weight,
         cx_min       = args.cx_min,
@@ -882,6 +930,8 @@ def main(args):
         guided_init         = args.guided_init,
         noise_sigma         = args.noise_sigma,
         sequential_ensemble = args.sequential_ensemble,
+        eval_every          = args.eval_every,
+        night_mode          = args.night_mode if hasattr(args, 'night_mode') else False,
     )
 
     torch.save(patch_01, args.out)
@@ -899,22 +949,80 @@ def main(args):
                    cx_min=args.cx_min, cx_max=args.cx_max,
                    cy_min=args.cy_min, cy_max=args.cy_max,
                    oblique_eot=args.oblique_eot,
-                   loss_fn=args.loss)
+                   loss_fn=args.loss,
+                   night_mode=args.night_mode)
 
-    # Final eval with deterministic INT8 fake-quant
+    # Final eval with deterministic INT8 fake-quant + sanity gate
     if quant_eval_models:
         print("\n── INT8 eval (deterministic per-tensor symmetric quant) ──")
-        _qh = {id(m): _build_quant_eval_hooks(m) for m in quant_eval_models}
-        evaluate_patch(quant_eval_models, val_ds, patch_01, target_label,
-                       target_patch_px=target_patch_px, device=device,
-                       n_eot=args.eot_samples,
-                       cx_min=args.cx_min, cx_max=args.cx_max,
-                       cy_min=args.cy_min, cy_max=args.cy_max,
-                       oblique_eot=args.oblique_eot,
-                       loss_fn=args.loss)
+
+        # Calibration loader — 100 clean samples for per-layer stats
+        _cal_loader = torch.utils.data.DataLoader(
+            val_ds, batch_size=32, shuffle=False, num_workers=0,
+        )
+        _cal_subset = []
+        _cal_count = 0
+        for _cb, _ in _cal_loader:
+            _cal_subset.append((_cb, _))
+            _cal_count += _cb.size(0)
+            if _cal_count >= 100:
+                break
+
+        # Sanity gate: check that INT8 clean accuracy doesn't collapse
+        # compared to float32.  If it drops >15pp, the fake-quant is destroying
+        # that surrogate's representations and the ASR number is meaningless.
+        _valid_quant_models = []
         for m in quant_eval_models:
-            for h in _qh[id(m)]:
+            arch_name = getattr(m, '_arch_name', '?')
+            # Measure float32 clean accuracy
+            _f32_correct = _f32_total = 0
+            with torch.no_grad():
+                for _cb, _cl in _cal_subset:
+                    _cb, _cl = _cb.to(device), _cl.to(device)
+                    _f32_correct += (m(_cb).argmax(1) == _cl).sum().item()
+                    _f32_total += _cb.size(0)
+            _f32_acc = _f32_correct / max(_f32_total, 1)
+
+            # Install INT8 hooks with calibration
+            _qh_test = _build_quant_eval_hooks(m, calibration_loader=_cal_loader)
+            _q8_correct = _q8_total = 0
+            with torch.no_grad():
+                for _cb, _cl in _cal_subset:
+                    _cb, _cl = _cb.to(device), _cl.to(device)
+                    _q8_correct += (m(_cb).argmax(1) == _cl).sum().item()
+                    _q8_total += _cb.size(0)
+            _q8_acc = _q8_correct / max(_q8_total, 1)
+            for h in _qh_test:
                 h.remove()
+
+            _drop = _f32_acc - _q8_acc
+            if _drop > 0.15:
+                print(f"  ⚠ INT8 eval INVALID for {arch_name}: "
+                      f"clean accuracy collapsed {_f32_acc:.1%} → {_q8_acc:.1%} "
+                      f"(drop={_drop:.1%} > 15% threshold). "
+                      f"Per-tensor symmetric quant destroys this architecture's activations. "
+                      f"Skipping from INT8 ASR measurement.")
+            else:
+                print(f"  ✓ {arch_name}: INT8 clean acc {_q8_acc:.1%} "
+                      f"(float32: {_f32_acc:.1%}, drop={_drop:.1%})")
+                _valid_quant_models.append(m)
+
+        if _valid_quant_models:
+            _qh = {id(m): _build_quant_eval_hooks(m, calibration_loader=_cal_loader)
+                   for m in _valid_quant_models}
+            evaluate_patch(_valid_quant_models, val_ds, patch_01, target_label,
+                           target_patch_px=target_patch_px, device=device,
+                           n_eot=args.eot_samples,
+                           cx_min=args.cx_min, cx_max=args.cx_max,
+                           cy_min=args.cy_min, cy_max=args.cy_max,
+                           oblique_eot=args.oblique_eot,
+                           loss_fn=args.loss,
+                           night_mode=args.night_mode)
+            for m in _valid_quant_models:
+                for h in _qh[id(m)]:
+                    h.remove()
+        else:
+            print("  ⚠ No surrogates passed INT8 sanity gate — skipping INT8 eval entirely.")
 
 
 if __name__ == "__main__":
@@ -936,7 +1044,13 @@ if __name__ == "__main__":
                    help="EOT samples per step (lower = less gradient variance, faster convergence)")
 
     p.add_argument("--batch",         type=int,   default=32)
+    p.add_argument("--eval-every",    type=int,   default=100,
+                   help="Run held-out eval every N steps (fixed batch, comparable across steps). "
+                        "Best patch by mean eval ASR is saved and returned.")
     p.add_argument("--print-cm",      type=float, default=8.0,  help="Printed patch size in cm")
+    p.add_argument("--sign-diam-mm",  type=float, default=450.0,
+                   help="Physical sign diameter in mm (AU=450, EU=190). Controls patch "
+                        "footprint calculation in model input space.")
     p.add_argument("--nps-weight",    type=float, default=0.01, help="Printability loss weight (0 to disable)")
     p.add_argument("--tv-weight",     type=float, default=0.05, help="Total variation loss weight (0 to disable)")
     # Model-side quantisation EOT — hooks each surrogate's Conv2d/Linear layers
@@ -989,4 +1103,8 @@ if __name__ == "__main__":
     p.add_argument("--sequential-ensemble", action="store_true", default=False,
                    help="Sequential ensemble optimisation (ZQ-Attack 2406.19311) — "
                         "each model incorporates predecessors' gradients with 1/j weighting")
+    p.add_argument("--night-mode",    action="store_true", default=False,
+                   help="Bias EOT toward night conditions: stronger retroreflection (0.3-0.6), "
+                        "darker brightness, warm (halogen) or cool (LED) colour temperature. "
+                        "Matches physical testing under headlights / carpark lighting.")
     main(p.parse_args())
