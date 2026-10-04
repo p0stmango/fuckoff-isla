@@ -47,6 +47,7 @@ _UNFREEZE_PATTERNS = {
     "mobilenet_v3_small":  ["features.12", "classifier"],
     "mobilenet_v3_large":  ["features.16", "classifier"],
     "efficientnet_b0":     ["features.8",  "classifier"],
+    "shufflenet_v2_x1_0": ["conv5", "fc"],
 }
 
 

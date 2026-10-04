@@ -46,6 +46,7 @@ ARCH_CHOICES = [
     "mobilenet_v3_small",
     "mobilenet_v3_large",
     "efficientnet_b0",
+    "shufflenet_v2_x1_0",
 ]
 
 
@@ -111,6 +112,10 @@ def _build_backbone(arch: str, pretrained: bool = True) -> nn.Module:
         weights = tvm.EfficientNet_B0_Weights.IMAGENET1K_V1 if pretrained else None
         m = tvm.efficientnet_b0(weights=weights)
         m.classifier[-1] = nn.Linear(m.classifier[-1].in_features, GTSRB_N_CLASSES)
+    elif arch == "shufflenet_v2_x1_0":
+        weights = tvm.ShuffleNet_V2_X1_0_Weights.IMAGENET1K_V1 if pretrained else None
+        m = tvm.shufflenet_v2_x1_0(weights=weights)
+        m.fc = nn.Linear(m.fc.in_features, GTSRB_N_CLASSES)
     else:
         raise ValueError(f"Unknown arch '{arch}'. Choose from: {ARCH_CHOICES}")
     return m

@@ -803,8 +803,13 @@ def main(args):
         # surrogate_mobilenet_v3_small.pt alongside surrogate.pt.
         stem   = Path(args.model).stem
         suffix = Path(args.model).suffix
-        arch_path = str(Path(args.model).parent / f"{stem}_{arch}{suffix}") \
-                    if arch != arch_list[0] else args.model
+        # First arch used to always get args.model directly, but that
+        # assumes the first arch is resnet18 (the default checkpoint).
+        # Now: resnet18 → args.model; everything else → derived path.
+        if arch == "resnet18":
+            arch_path = args.model
+        else:
+            arch_path = str(Path(args.model).parent / f"{stem}_{arch}{suffix}")
         ensemble.append(_load_or_build(arch_path, arch, args.pretrain_path, device))
 
     print(f"Ensemble: {[m._arch_name for m in ensemble]}")
