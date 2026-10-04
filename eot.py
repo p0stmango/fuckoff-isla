@@ -270,9 +270,14 @@ def _four_point_to_grid(src, dst, H, W, device):
 # GROUP 4 — LIGHTING
 # ════════════════════════════════════════════════════════════════════════════
 
-def apply_brightness_gamma(x: torch.Tensor) -> torch.Tensor:
-    brightness = _rand(0.45, 1.55)
-    gamma      = _rand(0.55, 1.65)
+def apply_brightness_gamma(x: torch.Tensor, night_mode: bool = False) -> torch.Tensor:
+    if night_mode:
+        # Night: darker overall — headlights illuminate the sign but ambient is low
+        brightness = _rand(0.20, 0.75)
+        gamma      = _rand(0.80, 2.0)   # higher gamma = darker midtones
+    else:
+        brightness = _rand(0.45, 1.55)
+        gamma      = _rand(0.55, 1.65)
     x = _ste_clamp_01(x * brightness)
     x = torch.pow(x + 1e-8, gamma)
     return _ste_clamp_01(x)
@@ -289,11 +294,11 @@ def apply_spotlight(x: torch.Tensor) -> torch.Tensor:
     return _ste_clamp_01(x * light)
 
 
-def apply_retroreflection(x: torch.Tensor) -> torch.Tensor:
+def apply_retroreflection(x: torch.Tensor, night_mode: bool = False) -> torch.Tensor:
     """Uniform retroreflection — legacy path when no patch mask is available."""
     B, C, H, W = x.shape
     sigma    = _rand(0.25, 0.55) * min(H, W)
-    strength = _rand(0.0, 0.5)
+    strength = _rand(0.3, 0.6) if night_mode else _rand(0.0, 0.5)
     gy = torch.arange(H, device=x.device, dtype=x.dtype).view(H, 1).expand(H, W)
     gx = torch.arange(W, device=x.device, dtype=x.dtype).view(1, W).expand(H, W)
     dist2 = (gx - W/2.0)**2 + (gy - H/2.0)**2
@@ -303,7 +308,8 @@ def apply_retroreflection(x: torch.Tensor) -> torch.Tensor:
 
 
 def apply_differential_retroreflection(x: torch.Tensor,
-                                        patch_mask: torch.Tensor) -> torch.Tensor:
+                                        patch_mask: torch.Tensor,
+                                        night_mode: bool = False) -> torch.Tensor:
     """
     The sign's retroreflective aluminium sheeting glows under headlights;
     the printed patch (matte paper / vinyl sticker) does not.  This creates
@@ -316,7 +322,7 @@ def apply_differential_retroreflection(x: torch.Tensor,
     """
     B, C, H, W = x.shape
     sigma    = _rand(0.25, 0.55) * min(H, W)
-    strength = _rand(0.15, 0.70)   # stronger range — real retro is dramatic
+    strength = _rand(0.40, 0.85) if night_mode else _rand(0.15, 0.70)
     gy = torch.arange(H, device=x.device, dtype=x.dtype).view(H, 1).expand(H, W)
     gx = torch.arange(W, device=x.device, dtype=x.dtype).view(1, W).expand(H, W)
     dist2 = (gx - W / 2.0) ** 2 + (gy - H / 2.0) ** 2
@@ -351,8 +357,18 @@ def apply_auto_exposure(x: torch.Tensor) -> torch.Tensor:
     return _ste_clamp_01(x)
 
 
-def apply_colour_temperature(x: torch.Tensor) -> torch.Tensor:
-    shift = _rand(-0.06, 0.08)
+def apply_colour_temperature(x: torch.Tensor, night_mode: bool = False) -> torch.Tensor:
+    if night_mode:
+        # Night: bias toward warm (halogen headlights, ~3200K) or cool
+        # (LED streetlights/headlights, ~5500K+).  Pick one per sample.
+        if random.random() < 0.55:
+            # Warm halogen headlights — strong red/yellow bias
+            shift = _rand(0.06, 0.14)
+        else:
+            # Cool LED streetlights — blue/white bias
+            shift = _rand(-0.12, -0.04)
+    else:
+        shift = _rand(-0.06, 0.08)
     tint  = torch.tensor([shift, shift * 0.3, -shift * 0.8],
                          device=x.device).view(1, 3, 1, 1)
     return _ste_clamp_01(x + tint)
@@ -846,7 +862,8 @@ def eot_print(x: torch.Tensor) -> torch.Tensor:
 def eot_scene(x: torch.Tensor, n_transforms: int = 3,
               oblique: bool = False,
               patch_mask: torch.Tensor = None,
-              training_step: int = None) -> torch.Tensor:
+              training_step: int = None,
+              night_mode: bool = False) -> torch.Tensor:
     """
     Scene-level EOT transforms — applied to the composited image (sign + patch
     together) because these happen in the physical world / camera, not the
@@ -897,16 +914,26 @@ def eot_scene(x: torch.Tensor, n_transforms: int = 3,
     # When we have the mask, apply differential retroreflection so the patch
     # must survive the brightness contrast.  Without a mask, fall back to
     # uniform retroreflection via the LIGHTING_TRANSFORMS list.
-    if has_mask and random.random() < 0.5:
-        x = apply_differential_retroreflection(x, warped_mask)
+    _retro_p = 0.75 if night_mode else 0.5
+    if has_mask and random.random() < _retro_p:
+        x = apply_differential_retroreflection(x, warped_mask, night_mode=night_mode)
 
     # ── lighting (always one) ─────────────────────────────────────────────
     if has_mask:
         # Retroreflection handled above — pick from base lighting only
-        x = random.choice(LIGHTING_TRANSFORMS_BASE)(x)
+        # Night mode: pass through to brightness_gamma and colour_temp
+        fn = random.choice(LIGHTING_TRANSFORMS_BASE)
+        if night_mode and fn in (apply_brightness_gamma, apply_colour_temperature):
+            x = fn(x, night_mode=True)
+        else:
+            x = fn(x)
     else:
         # Legacy path — retroreflection mixed in with other lighting
-        x = random.choice(LIGHTING_TRANSFORMS)(x)
+        fn = random.choice(LIGHTING_TRANSFORMS)
+        if night_mode and fn in (apply_brightness_gamma, apply_colour_temperature, apply_retroreflection):
+            x = fn(x, night_mode=True)
+        else:
+            x = fn(x)
 
     # ── camera (one or two) ───────────────────────────────────────────────
     n_cam = 1 if n_transforms <= 3 else 2
