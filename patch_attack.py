@@ -361,6 +361,15 @@ def optimise_patch(
         for p in m.parameters():
             p.requires_grad = False
 
+    # ── MPS performance: float16 autocast ────────────────────────────────
+    # Apple Silicon's ANE/GPU throughput roughly doubles in float16.
+    # The patch itself stays float32 (we need the precision for small
+    # gradient updates), but model forward passes and EOT transforms
+    # run in float16 via autocast.
+    _use_autocast = (device.type == "mps")
+    if _use_autocast:
+        print("MPS detected — enabling float16 autocast for forward passes")
+
     if init_patch is not None:
         print(f"Initialising patch from: {init_patch}")
         patch_01 = torch.load(init_patch, map_location=device)
@@ -497,31 +506,35 @@ def optimise_patch(
             #   δ_j = δ_0 - α·(1/j)·Σ∇_δ' L(x, δ'+σ, t, f_j)
             # This ensures each surrogate refines rather than overrides the
             # previous models' perturbation direction.
+            #
+            # Perf: EOT transforms (print→mount→geometry→lighting→camera) are
+            # shared across models within each EOT draw — only the model forward
+            # varies.  This saves ~2/3 of the transform overhead.
             for eot_i in range(eot_samples):
                 cx = random.uniform(cx_min, cx_max)
                 cy = random.uniform(cy_min, cy_max)
 
+                # Compute shared EOT scene ONCE per draw
+                patch_01_printed = eot_print(patch_01.clamp(0, 1))
+                if noise_sigma > 0:
+                    noise = torch.randn_like(patch_01_printed) * noise_sigma
+                    patch_01_printed = _ste_clamp_01(patch_01_printed + noise)
+                patch_norm_eot = to_normalised(patch_01_printed)
+                patched = apply_patch(imgs, patch_norm_eot, cx_frac=cx, cy_frac=cy,
+                                      randomise_placement=False,
+                                      target_patch_px=target_patch_px)
+                p_mask = make_patch_mask(B, IMG_SIZE, IMG_SIZE, target_patch_px,
+                                        cx, cy, device)
+                patched_01 = patched * std + mean
+                patched_01 = eot_scene(patched_01.clone(), oblique=oblique_eot,
+                                        patch_mask=p_mask, training_step=step,
+                                        night_mode=night_mode)
+                patched_eot = (patched_01 - mean) / std
+
+                # Run each model on the SAME transformed input
                 for mi, surrogate in enumerate(models):
-                    patch_01_printed = eot_print(patch_01.clamp(0, 1))
-
-                    # Gaussian noise injection for gradient smoothing
-                    if noise_sigma > 0:
-                        noise = torch.randn_like(patch_01_printed) * noise_sigma
-                        patch_01_printed = _ste_clamp_01(patch_01_printed + noise)
-
-                    patch_norm_eot = to_normalised(patch_01_printed)
-                    patched = apply_patch(imgs, patch_norm_eot, cx_frac=cx, cy_frac=cy,
-                                          randomise_placement=False,
-                                          target_patch_px=target_patch_px)
-                    p_mask = make_patch_mask(B, IMG_SIZE, IMG_SIZE, target_patch_px,
-                                            cx, cy, device)
-                    patched_01 = patched * std + mean
-                    patched_01 = eot_scene(patched_01.clone(), oblique=oblique_eot,
-                                            patch_mask=p_mask, training_step=step,
-                                            night_mode=night_mode)
-                    patched_eot = (patched_01 - mean) / std
-
-                    logits = surrogate(patched_eot)
+                    with torch.autocast("mps", dtype=torch.float16, enabled=_use_autocast):
+                        logits = surrogate(patched_eot)
                     if loss_fn == "untargeted":
                         loss = untargeted_loss(logits, labels, margin=cw_margin)
                     elif loss_fn == "margin":
@@ -561,7 +574,8 @@ def optimise_patch(
                                         night_mode=night_mode)
                 patched_eot = (patched_01 - mean) / std
 
-                logits = surrogate(patched_eot)
+                with torch.autocast("mps", dtype=torch.float16, enabled=_use_autocast):
+                    logits = surrogate(patched_eot)
                 if loss_fn == "untargeted":
                     loss = untargeted_loss(logits, labels, margin=cw_margin)
                 elif loss_fn == "margin":
@@ -591,9 +605,10 @@ def optimise_patch(
         if step > 1 and step % restart_period == 0:
             print(f"  [step {step}] LR warm restart → {cur_lr:.6f}")
 
-        # Flush MPS allocator every 5 steps to prevent memory fragmentation
-        # that causes progressive slowdown on Apple Silicon (4s → 170s+/iter)
-        if device.type == "mps" and step % 5 == 0:
+        # Flush MPS allocator periodically to prevent memory fragmentation.
+        # Every 50 steps is enough — every 5 was causing GPU pipeline stalls
+        # from forced synchronisation (~2-3s overhead per flush).
+        if device.type == "mps" and step % 50 == 0:
             torch.mps.empty_cache()
 
         with torch.no_grad():
