@@ -271,7 +271,7 @@ def untargeted_loss(logits: torch.Tensor, true_labels: torch.Tensor,
     B, C = logits.shape
     one_hot  = F.one_hot(true_labels, num_classes=C).bool()
     z_true   = logits[one_hot].view(B)                              # (B,)
-    z_other  = logits.masked_fill(one_hot, -1e9).max(dim=1).values  # (B,)
+    z_other  = logits.masked_fill(one_hot, -65000.0).max(dim=1).values  # (B,)  # fits float16
     return F.relu(z_true - z_other + margin).mean()
 
 
@@ -294,7 +294,7 @@ def margin_loss(logits: torch.Tensor, target: torch.Tensor,
     # Mask out the target class to find the best non-target logit
     one_hot  = F.one_hot(target, num_classes=C).bool()
     z_target = logits[one_hot].view(B)                              # (B,)
-    z_other  = logits.masked_fill(one_hot, -1e9).max(dim=1).values  # (B,)
+    z_other  = logits.masked_fill(one_hot, -65000.0).max(dim=1).values  # (B,)  # fits float16
     return F.relu(z_other - z_target + margin).mean()
 
 
