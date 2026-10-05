@@ -23,9 +23,9 @@ from PIL import Image, ImageDraw, ImageFont
 DPI           = 300
 A4_W_MM       = 210
 A4_H_MM       = 297
-REAL_SIGN_MM  = 300    # real AU carpark sign diameter (typical 300mm round, not 450mm)
+REAL_SIGN_MM  = 450    # real AU carpark sign diameter (standard 450mm round)
 SIGN_DIAM_MM  = 190    # rendered circle diameter on A4
-REAL_PATCH_MM = 80     # real patch side length (square)
+REAL_PATCH_MM = 100    # real patch side length (square) — must match --print-cm used in training
 PATCH_MM      = REAL_PATCH_MM * SIGN_DIAM_MM / REAL_SIGN_MM   # ~50.7 mm on A4
 
 # Backing plate: roughly 1.25× sign diameter, rounded corners
@@ -183,9 +183,10 @@ def test_surrogate(canvas: Image.Image, patch_path: str,
 
     if surrogate_paths is None:
         surrogate_paths = {
-            "resnet18":           ("surrogate.pt",                    "resnet18"),
-            "mobilenet_v3_small": ("surrogate_mobilenet_v3_small.pt", "mobilenet_v3_small"),
+            "mobilenet_v3_large": ("surrogate_mobilenet_v3_large.pt", "mobilenet_v3_large"),
             "efficientnet_b0":    ("surrogate_efficientnet_b0.pt",    "efficientnet_b0"),
+            "shufflenet_v2_x1_0": ("surrogate_shufflenet_v2_x1_0.pt", "shufflenet_v2_x1_0"),
+            "resnet18":           ("surrogate.pt",                    "resnet18"),
         }
 
     try:
