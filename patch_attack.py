@@ -257,6 +257,51 @@ def printability_loss(patch_01: torch.Tensor,
 
 # ── optimisation loop ────────────────────────────────────────────────────────
 
+def semi_targeted_probe(models, imgs, labels, patch_01, to_normalised_fn,
+                        eot_print_fn, eot_scene_fn, apply_patch_fn,
+                        make_patch_mask_fn, target_patch_px, cx_min, cx_max,
+                        cy_min, cy_max, mean, std, device, n_probes=8,
+                        oblique_eot=False, night_mode=False,
+                        _use_autocast=False, IMG_SIZE=224):
+    """
+    Probe which non-true class the ensemble prefers, for semi-targeted mode.
+    Runs n_probes EOT draws across all models and tallies predictions.
+    Returns the class index that appears most often (excluding true class).
+    """
+    import random as _random
+    from collections import Counter
+    votes = Counter()
+    B = imgs.size(0)
+    true_set = set(labels.cpu().tolist())
+
+    with torch.no_grad():
+        for _ in range(n_probes):
+            cx = _random.uniform(cx_min, cx_max)
+            cy = _random.uniform(cy_min, cy_max)
+            patch_printed = eot_print_fn(patch_01.detach().clamp(0, 1))
+            patch_norm = to_normalised_fn(patch_printed)
+            patched = apply_patch_fn(imgs, patch_norm, cx_frac=cx, cy_frac=cy,
+                                     randomise_placement=False,
+                                     target_patch_px=target_patch_px)
+            p_mask = make_patch_mask_fn(B, IMG_SIZE, IMG_SIZE,
+                                        target_patch_px, cx, cy, device)
+            patched_01 = patched * std + mean
+            patched_01 = eot_scene_fn(patched_01.clone(), oblique=oblique_eot,
+                                       patch_mask=p_mask, training_step=0,
+                                       night_mode=night_mode)
+            patched_eot = (patched_01 - mean) / std
+            for m in models:
+                with torch.autocast("mps", dtype=torch.float16, enabled=_use_autocast):
+                    preds = m(patched_eot).argmax(1)
+                for p in preds.cpu().tolist():
+                    if p not in true_set:
+                        votes[p] += 1
+
+    if not votes:
+        return None
+    return votes.most_common(1)[0][0]
+
+
 def untargeted_loss(logits: torch.Tensor, true_labels: torch.Tensor,
                     margin: float = 5.0) -> torch.Tensor:
     """
@@ -330,6 +375,7 @@ def optimise_patch(
     sequential_ensemble: bool = False, # sequential ensemble optimisation (ZQ-Attack)
     eval_every:   int   = 100,     # held-out eval interval (steps)
     night_mode:   bool  = False,   # bias EOT toward night conditions
+    semi_warmup:  int   = 150,     # steps of untargeted warmup for semi-targeted mode
 ) -> torch.Tensor:
     """
     patch_size is the PRINT resolution of the patch (e.g. 945 = 8cm @ 300 DPI).
@@ -411,7 +457,7 @@ def optimise_patch(
         # Average gradient across all surrogates
         for _m in models:
             _logits = _m(_init_patched)
-            if loss_fn == "untargeted":
+            if loss_fn in ("untargeted", "semi-targeted"):
                 _init_loss = _init_loss + untargeted_loss(_logits, _init_labels)
             else:
                 _init_loss = _init_loss + F.cross_entropy(
@@ -471,8 +517,45 @@ def optimise_patch(
     best_asr   = -1.0
     best_patch = patch_01.detach().clone()
 
+    # ── Semi-targeted state ──────────────────────────────────────────────
+    # During warmup: act as untargeted.  After warmup: probe the ensemble
+    # to find which non-true class dominates, then switch to targeted
+    # margin loss for that class — concentrating votes for temporal voting.
+    _semi_locked_target = None   # once set, an int class index
+    _effective_loss_fn  = loss_fn
+    if loss_fn == "semi-targeted":
+        _effective_loss_fn = "untargeted"
+        print(f"Semi-targeted : untargeted warmup for {semi_warmup} steps, then lock target")
+
     pbar = tqdm(range(1, steps + 1), desc="Optimising patch")
     for step in pbar:
+        # ── Semi-targeted: switch phase after warmup ─────────────────
+        if (loss_fn == "semi-targeted" and _semi_locked_target is None
+                and step == semi_warmup + 1):
+            # Probe which class the ensemble prefers
+            _probe_class = semi_targeted_probe(
+                models, _eval_imgs, _eval_labels, patch_01,
+                to_normalised, eot_print, eot_scene, apply_patch,
+                make_patch_mask, target_patch_px,
+                cx_min, cx_max, cy_min, cy_max,
+                mean, std, device, n_probes=16,
+                oblique_eot=oblique_eot, night_mode=night_mode,
+                _use_autocast=_use_autocast, IMG_SIZE=IMG_SIZE,
+            )
+            if _probe_class is not None:
+                _semi_locked_target = _probe_class
+                _effective_loss_fn  = "margin"
+                target_label        = _probe_class
+                target_t            = torch.tensor([_probe_class], device=device)
+                pbar.write(
+                    f"[step {step}] ★ Semi-targeted: locking onto "
+                    f"{ALL_SPEEDS[_probe_class]} km/h (label {_probe_class}) "
+                    f"— switching to margin loss")
+            else:
+                pbar.write(
+                    f"[step {step}] Semi-targeted: no dominant wrong class found, "
+                    f"continuing untargeted")
+
         if (fake_quant_schedule is not None and not fake_quant_schedule.enabled
                 and step >= fake_quant_warmup):
             fake_quant_schedule.enabled = True
@@ -535,9 +618,9 @@ def optimise_patch(
                 for mi, surrogate in enumerate(models):
                     with torch.autocast("mps", dtype=torch.float16, enabled=_use_autocast):
                         logits = surrogate(patched_eot)
-                    if loss_fn == "untargeted":
+                    if _effective_loss_fn == "untargeted":
                         loss = untargeted_loss(logits, labels, margin=cw_margin)
-                    elif loss_fn == "margin":
+                    elif _effective_loss_fn == "margin":
                         loss = margin_loss(logits, target_t.expand(B), margin=cw_margin)
                     else:
                         loss = F.cross_entropy(logits, target_t.expand(B))
@@ -576,9 +659,9 @@ def optimise_patch(
 
                 with torch.autocast("mps", dtype=torch.float16, enabled=_use_autocast):
                     logits = surrogate(patched_eot)
-                if loss_fn == "untargeted":
+                if _effective_loss_fn == "untargeted":
                     loss = untargeted_loss(logits, labels, margin=cw_margin)
-                elif loss_fn == "margin":
+                elif _effective_loss_fn == "margin":
                     loss = margin_loss(logits, target_t.expand(B), margin=cw_margin)
                 else:
                     loss = F.cross_entropy(logits, target_t.expand(B))
@@ -651,7 +734,7 @@ def optimise_patch(
                     patched_eot_log = (patched_01_log - mean) / std
                     for mi, m in enumerate(models):
                         preds = m(patched_eot_log).argmax(1)
-                        if loss_fn == "untargeted":
+                        if _effective_loss_fn == "untargeted":
                             _per_model_hits[mi] += (preds != _eval_labels).sum().item()
                         else:
                             _per_model_hits[mi] += (preds == target_label).sum().item()
@@ -693,7 +776,7 @@ def optimise_patch(
                         patched_eot_log = (patched_01_log - mean) / std
                         for mi, m in enumerate(quant_eval_models):
                             preds_q = m(patched_eot_log).argmax(1)
-                            if loss_fn == "untargeted":
+                            if _effective_loss_fn == "untargeted":
                                 _q_hits[mi] += (preds_q != _eval_labels).sum().item()
                             else:
                                 _q_hits[mi] += (preds_q == target_label).sum().item()
@@ -732,7 +815,10 @@ def optimise_patch(
             Image.fromarray((arr * 255).astype(np.uint8)).save(_inter_dir / f"patch_step_{step:04d}.png")
 
     print(f"\nBest patch from step {_best_step}: ASR={best_asr:.2%}  ({_best_detail})")
-    return best_patch, target_patch_px
+    if _semi_locked_target is not None:
+        print(f"Semi-targeted locked class: {ALL_SPEEDS[_semi_locked_target]} km/h "
+              f"(label {_semi_locked_target})")
+    return best_patch, target_patch_px, target_label
 
 
 # ── export ────────────────────────────────────────────────────────────────────
@@ -818,7 +904,7 @@ def evaluate_patch(
                                             night_mode=night_mode)
                     patched_eot = (patched_01 - mean) / std
                     preds       = m(patched_eot).argmax(1)
-                    if loss_fn == "untargeted":
+                    if loss_fn in ("untargeted",):
                         eot_votes += (preds != labels).long()
                     else:
                         eot_votes += (preds == target_label).long()
@@ -826,7 +912,12 @@ def evaluate_patch(
                 correct_targets[mi] += (eot_votes >= (n_eot // 2 + 1)).sum().item()
                 totals[mi]          += B
 
-    mode_str = "misclassify" if loss_fn == "untargeted" else f"target={ALL_SPEEDS[target_label]} km/h"
+    if loss_fn == "untargeted":
+        mode_str = "misclassify"
+    elif loss_fn == "semi-targeted":
+        mode_str = f"semi-targeted@{ALL_SPEEDS[target_label]} km/h"
+    else:
+        mode_str = f"target={ALL_SPEEDS[target_label]} km/h"
     print(f"\n── Patch Evaluation (EOT + random placement, {mode_str}) ──")
     arch_names = [getattr(m, '_arch_name', f'model_{i}') for i, m in enumerate(models)]
     for mi, name in enumerate(arch_names):
@@ -914,7 +1005,7 @@ def main(args):
         print(f"Quant eval: deterministic INT8 fake-quant on all {len(ensemble)} "
               f"surrogates during eval passes")
 
-    patch_01, target_patch_px = optimise_patch(
+    patch_01, target_patch_px, target_label = optimise_patch(
         models       = ensemble,
         dataset      = val_ds,
         target_label = target_label,
@@ -947,6 +1038,7 @@ def main(args):
         sequential_ensemble = args.sequential_ensemble,
         eval_every          = args.eval_every,
         night_mode          = args.night_mode if hasattr(args, 'night_mode') else False,
+        semi_warmup         = args.semi_warmup if hasattr(args, 'semi_warmup') else 150,
     )
 
     torch.save(patch_01, args.out)
@@ -1073,9 +1165,12 @@ if __name__ == "__main__":
     # embedded NPU without needing the real target's weights/calibration.
     p.add_argument("--init-patch",    default=None,
                    help="Path to a saved patch tensor (.pt) to resume from instead of random init")
-    p.add_argument("--loss",          default="ce", choices=["ce", "margin", "untargeted"],
+    p.add_argument("--loss",          default="ce", choices=["ce", "margin", "untargeted", "semi-targeted"],
                    help="Loss function: 'ce' (cross-entropy on target), 'margin' (CW-style margin "
-                        "on target), 'untargeted' (push away from true class — any misclassification wins)")
+                        "on target), 'untargeted' (push away from true class — any misclassification wins), "
+                        "'semi-targeted' (untargeted warmup, then lock onto the most-predicted wrong class)")
+    p.add_argument("--semi-warmup",   type=int, default=150,
+                   help="Steps of untargeted warmup before locking target in semi-targeted mode")
     p.add_argument("--margin",        type=float, default=5.0,
                    help="Margin for CW-style loss (logit gap target must exceed runner-up by)")
     p.add_argument("--no-fake-quant", action="store_true", default=False,
