@@ -107,6 +107,29 @@ def apply_paper_texture(x: torch.Tensor) -> torch.Tensor:
     return _ste_clamp_01(x * combined)
 
 
+def apply_matte_contrast_loss(x: torch.Tensor) -> torch.Tensor:
+    """
+    Model the contrast reduction of a matte paper print under real-world
+    viewing conditions.
+
+    A matte surface scatters reflected light diffusely — the darkest areas
+    pick up ambient light (raising blacks) while the brightest areas don't
+    reach retroreflective intensity (capping whites).  The net effect is
+    reduced dynamic range within the patch.
+
+    This is distinct from gamut compression (which models the CMYK colour
+    space) — this models the *viewing* physics of a matte surface under
+    directional illumination (carpark overheads, headlights).
+
+    Applied as: output = black_lift + (1 - black_lift - white_clip) * input
+    i.e. the input range [0, 1] is squeezed into [black_lift, 1 - white_clip].
+    """
+    black_lift = _rand(0.04, 0.18)  # ambient light raising shadows
+    white_clip = _rand(0.02, 0.12)  # matte surface can't reach full brightness
+    scale = 1.0 - black_lift - white_clip
+    return _ste_clamp_01(black_lift + scale * x)
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # GROUP 2 — MOUNTING ARTIFACTS
 # ════════════════════════════════════════════════════════════════════════════
@@ -317,21 +340,55 @@ def apply_differential_retroreflection(x: torch.Tensor,
     carpark lighting — the sign background is bright, the patch rectangle
     stays dark.
 
+    Two effects:
+      1. Sign background BOOST — retroreflective surface glows under any
+         directional light source (headlights, overhead carpark LEDs).
+      2. Patch DARKENING — matte paper scatters incident light instead of
+         retroreflecting it, so relative to the bright sign face, the patch
+         appears darker and lower-contrast than the digital design.
+
+    The combination is what killed the physical test: the camera saw a
+    bright white circle with a dark matte square — the contrast relationship
+    was inverted vs. what the surrogate trained on.
+
     patch_mask: (B, 1, H, W) — 1.0 where the patch is, 0.0 on sign background.
     Must already be geometry-warped to match x.
     """
     B, C, H, W = x.shape
     sigma    = _rand(0.25, 0.55) * min(H, W)
-    strength = _rand(0.40, 0.85) if night_mode else _rand(0.15, 0.70)
+    # Stronger ranges — real retroreflective signs are MUCH brighter than
+    # matte paper.  3M Diamond Grade sheeting retroreflects 250+ cd/lux/m²;
+    # matte paper returns ~5 cd/lux/m² — a 50:1 ratio.  After ISP tone
+    # mapping + CLAHE this compresses, but the contrast is still dramatic.
+    strength = _rand(0.60, 1.20) if night_mode else _rand(0.35, 0.90)
+
     gy = torch.arange(H, device=x.device, dtype=x.dtype).view(H, 1).expand(H, W)
     gx = torch.arange(W, device=x.device, dtype=x.dtype).view(1, W).expand(H, W)
     dist2 = (gx - W / 2.0) ** 2 + (gy - H / 2.0) ** 2
     retro = (0.1 + 2.2 * torch.exp(-dist2 / (2 * sigma ** 2)))
     retro = retro.view(1, 1, H, W).expand(B, C, H, W)
     boost = strength * (retro - 1.0)
-    # Only the sign background (non-patch) gets the retroreflective boost
+
     sign_mask = 1.0 - patch_mask                       # (B, 1, H, W)
+
+    # Effect 1: boost sign background (retroreflective glow)
     x = x * (1.0 + boost * sign_mask)
+
+    # Effect 2: darken & desaturate the patch region
+    # Matte paper under directional light appears darker relative to the
+    # retroreflective background.  Also loses colour saturation because
+    # the diffuse reflection mixes in ambient light (grey-shifted).
+    patch_darken = _rand(0.10, 0.35) if night_mode else _rand(0.05, 0.20)
+    patch_desat  = _rand(0.15, 0.45) if night_mode else _rand(0.05, 0.25)
+
+    # Darken: reduce brightness in patch region
+    x = x * (1.0 - patch_darken * patch_mask)
+
+    # Desaturate: pull patch pixels toward their luminance
+    if patch_desat > 0.01:
+        lum = (0.299 * x[:, 0:1] + 0.587 * x[:, 1:2] + 0.114 * x[:, 2:3])
+        x = x + patch_desat * patch_mask * (lum.expand_as(x) - x)
+
     return _ste_clamp_01(x)
 
 
@@ -800,6 +857,7 @@ PRINT_TRANSFORMS = [
     apply_channel_misregistration,
     apply_print_banding,
     apply_paper_texture,
+    apply_matte_contrast_loss,
 ]
 
 MOUNT_TRANSFORMS = [
@@ -842,18 +900,29 @@ CAMERA_TRANSFORMS = [
 def eot_print(x: torch.Tensor) -> torch.Tensor:
     """
     Print-only EOT transforms — gamut, CMYK, dot gain, banding, paper texture,
-    and mounting curl.  Applied to the PATCH ONLY, before compositing onto the
-    sign image.  The physical sign is retroreflective aluminium — it never
-    passes through a printer.
+    matte contrast loss, and mounting curl.  Applied to the PATCH ONLY, before
+    compositing onto the sign image.  The physical sign is retroreflective
+    aluminium — it never passes through a printer.
 
     A real inkjet print suffers ALL these artefacts simultaneously (gamut
     compression AND dot gain AND banding etc.), not one at a time.  We sample
     2–3 and apply them in sequence so the patch must survive the stacked
     degradation, not just each artefact individually.
+
+    Matte contrast loss is applied with high probability (~80%) as a separate
+    step because it's the single biggest contributor to the physical domain
+    gap — the matte paper's reduced dynamic range is what makes the patch
+    invisible to the camera when the sign background is retroreflecting.
     """
+    # Core print artefacts (sample 2-3)
     n = random.randint(2, min(3, len(PRINT_TRANSFORMS)))
     for fn in random.sample(PRINT_TRANSFORMS, k=n):
         x = fn(x)
+    # Matte contrast loss — always-on except 20% skip for diversity
+    # This is the critical domain gap: even if the other print artefacts are
+    # mild, a matte patch on a retroreflective sign always has reduced DR.
+    if random.random() < 0.80:
+        x = apply_matte_contrast_loss(x)
     if random.random() < 0.6:
         x = apply_paper_curl(x)
     return _ste_clamp_01(x)
@@ -914,7 +983,13 @@ def eot_scene(x: torch.Tensor, n_transforms: int = 3,
     # When we have the mask, apply differential retroreflection so the patch
     # must survive the brightness contrast.  Without a mask, fall back to
     # uniform retroreflection via the LIGHTING_TRANSFORMS list.
-    _retro_p = 0.75 if night_mode else 0.5
+    #
+    # Probability is HIGH because Australian speed signs are ALWAYS
+    # retroreflective (AS 1742 / AS 1906 compliant sheeting).  The only
+    # time the effect is weak is full daylight from behind the camera
+    # (no directional light to retroreflect).  Carpark signs under
+    # overhead lighting + headlights → strong retroreflection every time.
+    _retro_p = 0.90 if night_mode else 0.80
     if has_mask and random.random() < _retro_p:
         x = apply_differential_retroreflection(x, warped_mask, night_mode=night_mode)
 
