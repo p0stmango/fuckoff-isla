@@ -6,17 +6,20 @@ resizes to 224×224 via val_transforms, applies EOT, and reports per-model
 predictions. This is the closest digital proxy to "print → photograph → classify".
 
 Supports both targeted (ASR@80) and untargeted (any misclassification) modes.
+Includes deterministic INT8 fake-quant evaluation (matches EyeQ4 NPU inference).
 
 Usage:
     python eval_printable.py                                      # default: untargeted
     python eval_printable.py --loss untargeted                    # any misclassification = success
     python eval_printable.py --loss targeted                      # only 80 km/h counts
     python eval_printable.py --printable my_sign.png --n-eot 64
+    python eval_printable.py --no-quant                           # skip INT8 eval
 """
 import argparse
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 
 # ── physical constants (must match make_printable.py) ────────────────────────
@@ -171,6 +174,66 @@ def main(args):
         true_marker = " ◄ true" if idx == true_label else ""
         print(f"  {ALL_SPEEDS[idx]:>3} km/h  {bar}  {count:>4} ({pct:>5.1%}){true_marker}")
 
+    # ── INT8 quantised evaluation ─────────────────────────────────────────────
+    if not args.no_quant:
+        from patch_attack import _build_quant_eval_hooks
+
+        print(f"\n── INT8 quantised EOT vote ({args.n_eot} samples, {mode_str}) ──")
+
+        # Install deterministic fake-quant hooks on each model, run EOT, remove
+        q_votes = {name: [0] * len(ALL_SPEEDS) for name in models}
+
+        for name, m in models.items():
+            hooks = _build_quant_eval_hooks(m)
+            try:
+                with torch.no_grad():
+                    for i in range(args.n_eot):
+                        t01   = sign_tensor * std + mean
+                        t01   = eot_batch(t01.clone())
+                        t_eot = (t01 - mean) / std
+                        q_votes[name][m(t_eot).argmax(1).item()] += 1
+            finally:
+                for h in hooks:
+                    h.remove()
+
+        # Per-model table
+        if untargeted:
+            print(f"  {'Model':<25}  {'Top pred':>9}  {'Conf':>6}  {'qASR(≠5)':>9}")
+        else:
+            print(f"  {'Model':<25}  {'Top pred':>9}  {'Conf':>6}  {'qASR@80':>8}")
+        print("  " + "─" * 56)
+        worst_qasr = 1.0
+        for name, v in q_votes.items():
+            best = max(range(len(v)), key=lambda i: v[i])
+            conf = v[best] / args.n_eot
+            if untargeted:
+                qasr = 1.0 - (v[true_label] / args.n_eot)
+            else:
+                qasr = v[target_pred] / args.n_eot
+            hit = " ✓" if (untargeted and best != true_label) or (not untargeted and best == target_pred) else ""
+            worst_qasr = min(worst_qasr, qasr)
+            print(f"  {name:<25}  {ALL_SPEEDS[best]:>5} km/h  {conf:>5.1%}  {qasr:>6.1%}{hit}")
+
+        qlabel = "Ensemble worst-case qASR(≠5)" if untargeted else "Ensemble worst-case qASR@80"
+        print(f"  {qlabel:<25}  {'':>9}  {'':>6}  {worst_qasr:>6.1%}")
+
+        # INT8 class distribution histogram
+        q_total_votes = [0] * len(ALL_SPEEDS)
+        for v in q_votes.values():
+            for i, c in enumerate(v):
+                q_total_votes[i] += c
+        q_total = sum(q_total_votes)
+        q_ranked = sorted(enumerate(q_total_votes), key=lambda x: -x[1])
+        print(f"\n── INT8 class distribution (all models, {args.n_eot} EOT × {len(models)} models = {q_total} votes) ──")
+        q_peak = max(q_total_votes) if max(q_total_votes) > 0 else 1
+        for idx, count in q_ranked:
+            if count == 0:
+                continue
+            pct = count / q_total
+            bar = "█" * max(1, int(bar_max * count / q_peak))
+            true_marker = " ◄ true" if idx == true_label else ""
+            print(f"  {ALL_SPEEDS[idx]:>3} km/h  {bar}  {count:>4} ({pct:>5.1%}){true_marker}")
+
     print(f"\nCheck eval_crop.png to confirm the patch is visible and centred in the crop.")
 
 
@@ -184,4 +247,6 @@ if __name__ == "__main__":
                    choices=["targeted", "untargeted"],
                    help="'untargeted': any misclassification = success; "
                         "'targeted': only 80 km/h counts")
+    p.add_argument("--no-quant",  action="store_true", default=False,
+                   help="Skip INT8 quantised evaluation")
     main(p.parse_args())
