@@ -150,6 +150,27 @@ def main(args):
 
     label = "Ensemble worst-case ASR(≠5)" if untargeted else "Ensemble worst-case ASR@80"
     print(f"  {label:<25}  {'':>9}  {'':>6}  {worst_asr:>6.1%}")
+
+    # ── Per-class vote histogram ─────────────────────────────────────────────
+    # Aggregate votes across all models to show where predictions land
+    total_votes = [0] * len(ALL_SPEEDS)
+    for v in votes.values():
+        for i, c in enumerate(v):
+            total_votes[i] += c
+    total = sum(total_votes)
+    # Sort by count descending, show classes that got any votes
+    ranked = sorted(enumerate(total_votes), key=lambda x: -x[1])
+    print(f"\n── Class distribution (all models, {args.n_eot} EOT × {len(models)} models = {total} votes) ──")
+    bar_max = 40
+    peak = max(total_votes) if max(total_votes) > 0 else 1
+    for idx, count in ranked:
+        if count == 0:
+            continue
+        pct = count / total
+        bar = "█" * max(1, int(bar_max * count / peak))
+        true_marker = " ◄ true" if idx == true_label else ""
+        print(f"  {ALL_SPEEDS[idx]:>3} km/h  {bar}  {count:>4} ({pct:>5.1%}){true_marker}")
+
     print(f"\nCheck eval_crop.png to confirm the patch is visible and centred in the crop.")
 
 
